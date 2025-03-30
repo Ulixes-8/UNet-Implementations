@@ -1,0 +1,224 @@
+# Oxford-IIIT Pet Dataset Augmentation Configuration
+# Cat augmentation parameters (more aggressive)
+cat:
+  # Spatial transforms
+  horizontal_flip_prob: 0.5
+  scale_limit: 0.15
+  rotate_limit: 15
+  shift_limit: 0.1
+  shift_scale_rotate_prob: 0.8
+  
+  # RandomResizedCrop parameters
+  random_resized_crop:
+    size: (512, 512)  # Single size parameter for both dimensions
+    scale: [0.8, 1.0]
+    ratio: [0.9, 1.1]
+    prob: 0.3
+  
+  # CoarseDropout for occlusion tests (black squares of size 0-45px)
+  coarse_dropout:
+    max_holes: 1
+    min_height: 0
+    max_height: 45
+    min_width: 0
+    max_width: 45
+    fill_value: 0
+    prob: 0.4
+  
+  # Elastic transforms
+  elastic_transform_prob: 0.3
+  elastic:
+    alpha: 40.0
+    sigma: 4.0
+    alpha_affine: 15.0
+    prob: 0.6
+  grid_distortion:
+    num_steps: 5
+    distort_limit: 0.2
+    prob: 0.5
+  optical_distortion:
+    distort_limit: 0.2
+    shift_limit: 0.15
+    prob: 0.5
+  
+  # Pixel-level transforms
+  color_transform_prob: 0.8
+  brightness_contrast:
+    # Range matches ±0-45 pixel values (45/255 ≈ 0.176)
+    brightness_limit: 0.176
+    # Combined range for contrast increase (1.0-1.25) and decrease (0.1-1.0)
+    # In Albumentations, this is represented as [-0.9, 0.25]
+    contrast_limit: [-0.9, 0.25]
+    prob: 0.8
+  hsv:
+    hue_shift_limit: 10
+    sat_shift_limit: 30
+    val_shift_limit: 20
+    prob: 0.5
+  rgb_shift:
+    r_shift_limit: 15
+    g_shift_limit: 15
+    b_shift_limit: 15
+    prob: 0.5
+  
+  # Noise and blur
+  noise_transform_prob: 0.4
+  gauss_noise:
+    var_limit: [0.0, 18.0]
+    prob: 0.5
+  gaussian_blur:
+    blur_limit: [0, 9]
+    prob: 0.4
+  motion_blur:
+    blur_limit: 3
+    prob: 0.4
+  
+  # Lighting variations
+  lighting_transform_prob: 0.3
+  shadow:
+    prob: 0.3
+  sunflare:
+    prob: 0.2
+    
+  # Salt and Pepper noise
+  salt_pepper:
+    prob: 0.3
+    salt_p: [0.0, 0.18]
+    pepper_p: [0.0, 0.18]
+  
+  # ISO noise
+  iso_noise:
+    prob: 0.3
+    color_shift: [0.01, 0.05]
+    intensity: [0.1, 0.5]
+  
+  # Random fog
+  fog:
+    prob: 0.2
+    fog_coef_lower: 0.1
+    fog_coef_upper: 0.3
+    alpha_coef: 0.08
+  
+  # CLAHE and equalization
+  clahe_equalize:
+    prob: 0.3
+    clahe_clip_limit: 4.0
+    clahe_tile_grid_size: [8, 8]
+    clahe_prob: 0.5
+    equalize_prob: 0.5
+    to_gray_prob: 0.2
+    
+  # Perspective transform
+  perspective:
+    prob: 0.3
+    scale: [0.05, 0.1]
+
+# Dog augmentation parameters (more conservative)
+dog:
+  # Spatial transforms
+  horizontal_flip_prob: 0.5
+  scale_limit: 0.1
+  rotate_limit: 10
+  shift_limit: 0.05
+  shift_scale_rotate_prob: 0.5
+  
+  # RandomResizedCrop parameters (more conservative)
+  random_resized_crop:
+    size: (512, 512) # Single size parameter for both dimensions
+    scale: [0.9, 1.0]
+    ratio: [0.95, 1.05]
+    prob: 0.2
+  
+  # CoarseDropout for occlusion tests (black squares of size 0-45px)
+  coarse_dropout:
+    max_holes: 1
+    min_height: 0
+    max_height: 45
+    min_width: 0
+    max_width: 45
+    fill_value: 0
+    prob: 0.3
+  
+  # Elastic transforms
+  elastic_transform_prob: 0.2
+  elastic:
+    alpha: 30.0
+    sigma: 3.0
+    alpha_affine: 10.0
+    prob: 0.4
+  grid_distortion:
+    num_steps: 4
+    distort_limit: 0.15
+    prob: 0.4
+  
+  # Pixel-level transforms
+  color_transform_prob: 0.6
+  brightness_contrast:
+    # Range matches ±0-45 pixel values (45/255 ≈ 0.176)
+    brightness_limit: 0.176
+    # Combined range for contrast increase (1.0-1.25) and decrease (0.1-1.0)
+    # In Albumentations, this is represented as [-0.9, 0.25]
+    contrast_limit: [-0.9, 0.25]
+    prob: 0.7
+  hsv:
+    hue_shift_limit: 5
+    sat_shift_limit: 20
+    val_shift_limit: 15
+    prob: 0.4
+  rgb_shift:
+    r_shift_limit: 10
+    g_shift_limit: 10
+    b_shift_limit: 10
+    prob: 0.3
+  
+  # Noise and blur
+  noise_transform_prob: 0.3
+  gauss_noise:
+    var_limit: [0.0, 18.0]
+    prob: 0.3
+  gaussian_blur:
+    blur_limit: [0, 9]
+    prob: 0.3
+  motion_blur:
+    blur_limit: 3
+    prob: 0.3
+    
+  # Salt and Pepper noise
+  salt_pepper:
+    prob: 0.2
+    salt_p: [0.0, 0.18]
+    pepper_p: [0.0, 0.18]
+  
+  # ISO noise
+  iso_noise:
+    prob: 0.2
+    color_shift: [0.01, 0.03]
+    intensity: [0.1, 0.3]
+  
+  # Random fog
+  fog:
+    prob: 0.15
+    fog_coef_lower: 0.08
+    fog_coef_upper: 0.2
+    alpha_coef: 0.08
+  
+  # CLAHE and equalization
+  clahe_equalize:
+    prob: 0.2
+    clahe_clip_limit: 3.0
+    clahe_tile_grid_size: [8, 8]
+    clahe_prob: 0.4
+    equalize_prob: 0.4
+    to_gray_prob: 0.15
+  
+  # Lighting variations
+  lighting_transform_prob: 0.2
+  shadow:
+    prob: 0.2
+  sunflare:
+    prob: 0.1
+    
+  # Perspective transform
+  perspective:
+    prob: 0.2
+    scale: [0.03, 0.07]

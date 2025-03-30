@@ -1,5 +1,3 @@
-# Create a setup script
-cat > setup_env.sh << 'EOF'
 #!/bin/bash
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -13,6 +11,3 @@ echo "nnU-Net environment variables set to repository locations:"
 echo "nnUNet_raw = $nnUNet_raw"
 echo "nnUNet_preprocessed = $nnUNet_preprocessed"
 echo "nnUNet_results = $nnUNet_results"
-EOF
-
-chmod +x setup_env.sh

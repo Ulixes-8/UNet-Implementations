@@ -20,13 +20,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+import cv2
 from tqdm import tqdm
 
 # Import local modules
-from data.dataset import PetTrainDataset, PetValidationDataset
 from models.losses import DC_and_CE_loss, DeepSupervisionWrapper
-from models.unet import UNet  
+from models.unet import UNet
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data",
-        help="Path to the data directory"
+        default="/home/ulixes/segmentation_cv/unet/data/processed",
+        help="Path to the processed data directory"
     )
     
     parser.add_argument(
@@ -121,6 +121,97 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class PetSegmentationDataset(Dataset):
+    """Dataset class for the Oxford-IIIT Pet segmentation dataset."""
+    
+    def __init__(
+        self,
+        images_dir: str,
+        masks_dir: str,
+        include_augmented: bool = True
+    ):
+        """
+        Initialize the dataset.
+        
+        Args:
+            images_dir: Directory containing images
+            masks_dir: Directory containing mask annotations
+            include_augmented: Whether to include augmented images (if available)
+        """
+        self.images_dir = Path(images_dir)
+        self.masks_dir = Path(masks_dir)
+        
+        # Get all image files from the directory
+        self.image_files = sorted(list(self.images_dir.glob("*.jpg")))
+        
+        # Check for augmented data directory
+        if include_augmented and (self.images_dir.parent / "augmented" / "images").exists():
+            aug_images_dir = self.images_dir.parent / "augmented" / "images"
+            aug_masks_dir = self.images_dir.parent / "augmented" / "masks"
+            
+            # Add augmented images to the dataset
+            aug_image_files = sorted(list(aug_images_dir.glob("*.jpg")))
+            self.aug_image_files = aug_image_files
+            self.aug_masks_dir = aug_masks_dir
+            
+            self.image_files.extend(aug_image_files)
+        else:
+            self.aug_image_files = []
+            self.aug_masks_dir = None
+    
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
+        return len(self.image_files)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a sample from the dataset.
+        
+        Args:
+            idx: Index of the sample to retrieve
+            
+        Returns:
+            Dict containing image and mask tensors
+        """
+        # Get image file path
+        img_path = self.image_files[idx]
+        
+        # Determine if this is an augmented image
+        is_augmented = img_path in self.aug_image_files if self.aug_image_files else False
+        
+        # Get corresponding mask file path
+        if is_augmented and self.aug_masks_dir:
+            mask_path = self.aug_masks_dir / f"{img_path.stem}.png"
+        else:
+            mask_path = self.masks_dir / f"{img_path.stem}.png"
+        
+        # Load image and mask
+        image = cv2.imread(str(img_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        
+        # Convert 255 (ignore label) to 250 (a new ignore label that won't cause index errors)
+        # This is a simpler approach to handle invalid indices in the loss function
+        mask = np.where(mask == 255, 250, mask)
+        
+        # Ensure other values are within valid range (0, 1, 2)
+        mask = np.where((mask > 2) & (mask != 250), 0, mask)
+        
+        # Convert image to tensor and normalize (0-1)
+        image = torch.from_numpy(image).float().permute(2, 0, 1) / 255.0
+        
+        # Apply standardization (approximately equivalent to ImageNet normalization)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image = (image - mean) / std
+        
+        # Convert mask to tensor
+        mask = torch.from_numpy(mask).long()
+        
+        return {"image": image, "mask": mask}
+
+
 def create_dataloaders(
     data_dir: Union[str, Path],
     batch_size: int,
@@ -137,9 +228,29 @@ def create_dataloaders(
     Returns:
         Tuple of (train_loader, val_loader)
     """
+    # Set directories for training data
+    train_imgs_dir = Path(data_dir) / "Train" / "resized"
+    train_masks_dir = Path(data_dir) / "Train" / "resized_label"
+    
+    # Set directories for validation data
+    val_imgs_dir = Path(data_dir) / "Val" / "resized"
+    val_masks_dir = Path(data_dir) / "Val" / "processed_labels"
+    
     # Create datasets
-    train_dataset = PetTrainDataset(data_dir)
-    val_dataset = PetValidationDataset(data_dir)
+    train_dataset = PetSegmentationDataset(
+        images_dir=train_imgs_dir,
+        masks_dir=train_masks_dir,
+        include_augmented=True
+    )
+    
+    val_dataset = PetSegmentationDataset(
+        images_dir=val_imgs_dir,
+        masks_dir=val_masks_dir,
+        include_augmented=False
+    )
+    
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -178,7 +289,6 @@ def create_model(device: torch.device) -> nn.Module:
         num_classes=3,  # background, cat, dog
         n_stages=8,
         features_per_stage=[32, 64, 128, 256, 512, 512, 512, 512],
-        conv_op=nn.Conv2d,
         kernel_sizes=[[3, 3]] * 8,
         strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
         n_conv_per_stage=[2] * 8,
@@ -280,7 +390,7 @@ def validate(
     val_loader: DataLoader,
     loss_function: nn.Module,
     device: torch.device,
-    ignore_label: int = 255
+    ignore_label: int = 250  # New ignore label
 ) -> Tuple[float, Dict[str, float]]:
     """
     Validate the model on the validation set.
@@ -331,7 +441,7 @@ def validate(
                 pred_cls = (preds == cls_idx).float()
                 mask_cls = (masks == cls_idx).float()
                 
-                # Ignore border pixels (class 255)
+                # Ignore border pixels (class 250)
                 ignore_mask = (masks != ignore_label).float()
                 pred_cls = pred_cls * ignore_mask
                 mask_cls = mask_cls * ignore_mask
@@ -439,6 +549,10 @@ def save_checkpoint(
         output_dir: Directory to save to
         is_best: Whether this is the best model so far
     """
+    # Create the checkpoint directory
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
     # Create the checkpoint dictionary
     checkpoint = {
         "epoch": epoch,
@@ -449,7 +563,7 @@ def save_checkpoint(
     }
     
     # Save the checkpoint
-    checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pth"
+    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
     torch.save(checkpoint, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
     

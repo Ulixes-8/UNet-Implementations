@@ -67,7 +67,8 @@ def get_tp_fp_fn(net_output: torch.Tensor,
                  gt: torch.Tensor, 
                  axes: Optional[Union[List[int], Tuple[int, ...], np.ndarray]] = None,
                  mask: Optional[torch.Tensor] = None, 
-                 square: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                 square: bool = False,
+                 ignore_label: int = 255) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculate true positives (TP), false positives (FP), and false negatives (FN).
     
@@ -77,6 +78,7 @@ def get_tp_fp_fn(net_output: torch.Tensor,
         axes: Spatial dimensions to sum over. If None, sums over all spatial dimensions.
         mask: Optional binary mask for region of interest
         square: Whether to square TP, FP, FN values before summation
+        ignore_label: Label to ignore in evaluation (e.g., border regions)
         
     Returns:
         Tuple of (TP, FP, FN) tensors
@@ -87,6 +89,13 @@ def get_tp_fp_fn(net_output: torch.Tensor,
     shp_x = net_output.shape
     shp_y = gt.shape
 
+    # Create an ignore mask for pixels with ignore_label
+    ignore_mask = None
+    if ignore_label is not None:
+        ignore_mask = (gt != ignore_label)
+        if len(ignore_mask.shape) > len(shp_x) - 1:
+            ignore_mask = ignore_mask.squeeze(1)
+
     with torch.no_grad():
         if len(shp_x) != len(shp_y):
             gt = gt.view((shp_y[0], 1, *shp_y[1:]))
@@ -95,13 +104,28 @@ def get_tp_fp_fn(net_output: torch.Tensor,
             # If shapes match, ground truth is probably already one-hot encoded
             y_onehot = gt
         else:
-            gt = gt.long()
+            # Create a copy of gt that replaces ignore_label with 0 (to avoid index errors)
+            gt_temp = gt.clone()
+            if ignore_label is not None:
+                gt_temp[gt == ignore_label] = 0
+            
+            gt_temp = gt_temp.long()
             y_onehot = torch.zeros(shp_x, device=net_output.device)
-            y_onehot.scatter_(1, gt, 1)
+            y_onehot.scatter_(1, gt_temp, 1)
+            
+            # Mask out the ignore regions in the one-hot encoded gt
+            if ignore_mask is not None:
+                y_onehot = y_onehot * ignore_mask.unsqueeze(1)
 
-    tp = net_output * y_onehot
-    fp = net_output * (1 - y_onehot)
-    fn = (1 - net_output) * y_onehot
+    # Apply ignore mask to net_output if needed
+    net_output_masked = net_output
+    if ignore_mask is not None:
+        net_output_masked = net_output * ignore_mask.unsqueeze(1)
+
+    # Calculate TP, FP, FN using masked versions
+    tp = net_output_masked * y_onehot
+    fp = net_output_masked * (1 - y_onehot)
+    fn = (1 - net_output_masked) * y_onehot
 
     if mask is not None:
         tp = torch.stack(tuple(x_i * mask[:, 0] for x_i in torch.unbind(tp, dim=1)), dim=1)
@@ -132,7 +156,8 @@ class SoftDiceLoss(nn.Module):
                  batch_dice: bool = False, 
                  do_bg: bool = True, 
                  smooth: float = 1.0,
-                 square: bool = False):
+                 square: bool = False,
+                 ignore_label: int = 255):
         """
         Initialize SoftDiceLoss.
         
@@ -142,6 +167,7 @@ class SoftDiceLoss(nn.Module):
             do_bg: Whether to include background class in loss
             smooth: Smoothing factor to avoid division by zero
             square: Whether to square TP, FP, FN values before summation
+            ignore_label: Label to ignore in evaluation (e.g., border regions)
         """
         super(SoftDiceLoss, self).__init__()
 
@@ -150,6 +176,7 @@ class SoftDiceLoss(nn.Module):
         self.batch_dice = batch_dice
         self.apply_nonlin = apply_nonlin
         self.smooth = smooth
+        self.ignore_label = ignore_label
 
     def forward(self, 
                 x: torch.Tensor, 
@@ -176,7 +203,9 @@ class SoftDiceLoss(nn.Module):
         if self.apply_nonlin is not None:
             x = self.apply_nonlin(x)
 
-        tp, fp, fn = get_tp_fp_fn(x, y, axes, loss_mask, self.square)
+        tp, fp, fn = get_tp_fp_fn(
+            x, y, axes, loss_mask, self.square, ignore_label=self.ignore_label
+        )
 
         dc = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
 
@@ -211,7 +240,14 @@ class CrossEntropyND(nn.CrossEntropyLoss):
         Returns:
             Cross entropy loss value
         """
-        target = target.long()
+        # Create a copy of target to avoid modifying the original
+        target_temp = target.clone()
+        
+        # Replace ignore label (255) with 0 to avoid indexing errors
+        # The ignore label will be handled by the loss function's ignore_index parameter
+        target_temp[target == 255] = 0
+        
+        target_temp = target_temp.long()
         num_classes = inp.size()[1]
         
         # Reshape input for cross entropy: (B, C, D1, D2, ...) -> (B*D1*D2*..., C)
@@ -227,9 +263,20 @@ class CrossEntropyND(nn.CrossEntropyLoss):
         inp = inp.view(-1, num_classes)
         
         # Reshape target to match: (B, 1, D1, D2, ...) -> (B*D1*D2*...)
-        target = target.view(-1)
+        target_temp = target_temp.view(-1)
         
-        return super(CrossEntropyND, self).forward(inp, target)
+        # Create a mask for non-ignored pixels
+        mask = (target != 255).view(-1)
+        
+        # Apply the mask to both input and target
+        masked_inp = inp[mask]
+        masked_target = target_temp[mask]
+        
+        if masked_inp.shape[0] == 0:
+            return torch.tensor(0.0, device=inp.device, requires_grad=True)
+        
+        # Compute CE loss only on non-ignored pixels
+        return nn.functional.cross_entropy(masked_inp, masked_target)
 
 
 class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
@@ -253,13 +300,20 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
         Returns:
             Cross entropy loss value
         """
+        # Create a copy of target to avoid modifying the original
+        target_temp = target.clone()
+        
+        # Replace ignore label (255) with 0 to avoid indexing errors
+        # The ignore label will be handled separately with a mask
+        target_temp[target == 255] = 0
+        
         # Check if target is one-hot encoded
         if len(target.shape) > 1:
             # Convert one-hot encoding to class indices
             if target.shape[1] > 1:
-                target = target.argmax(1)
+                target_temp = target_temp.argmax(1)
             else:
-                target = target[:, 0]
+                target_temp = target_temp[:, 0]
                 
         # Create cross entropy input of shape (N, C)
         if len(inp.shape) > 2:
@@ -267,9 +321,21 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
             inp = inp.transpose(1, -1)  # Convert to (B, ..., C)
             inp = inp.reshape(-1, inp.size(-1))  # Reshape to (B*..., C)
             
-        target = target.reshape(-1)
+        target_temp = target_temp.reshape(-1)
         
-        return super(RobustCrossEntropyLoss, self).forward(inp, target)
+        # Create a mask for non-ignored pixels
+        mask = (target.reshape(-1) != 255)
+        
+        # Apply the mask to both input and target
+        masked_inp = inp[mask]
+        masked_target = target_temp[mask]
+        
+        # Handle empty mask case
+        if masked_inp.shape[0] == 0:
+            return torch.tensor(0.0, device=inp.device, requires_grad=True)
+        
+        # Compute CE loss only on non-ignored pixels
+        return nn.functional.cross_entropy(masked_inp, masked_target)
 
 
 class DC_and_CE_loss(nn.Module):
@@ -283,7 +349,8 @@ class DC_and_CE_loss(nn.Module):
     def __init__(self, 
                  soft_dice_kwargs: Optional[Dict] = None, 
                  ce_kwargs: Optional[Dict] = None, 
-                 aggregate: str = "sum"):
+                 aggregate: str = "sum",
+                 ignore_label: int = 255):
         """
         Initialize combined Dice and Cross Entropy loss.
         
@@ -291,13 +358,17 @@ class DC_and_CE_loss(nn.Module):
             soft_dice_kwargs: Arguments for SoftDiceLoss
             ce_kwargs: Arguments for CrossEntropyND
             aggregate: How to aggregate the losses ('sum' for now)
+            ignore_label: Label to ignore in evaluation (e.g., border regions)
         """
         super(DC_and_CE_loss, self).__init__()
         
         self.aggregate = aggregate
+        self.ignore_label = ignore_label
         
         if soft_dice_kwargs is None:
-            soft_dice_kwargs = {'batch_dice': True, 'do_bg': False, 'smooth': 1e-5}
+            soft_dice_kwargs = {'batch_dice': True, 'do_bg': False, 'smooth': 1e-5, 'ignore_label': ignore_label}
+        else:
+            soft_dice_kwargs['ignore_label'] = ignore_label
             
         if ce_kwargs is None:
             ce_kwargs = {}

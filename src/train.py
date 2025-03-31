@@ -26,7 +26,7 @@ from tqdm import tqdm
 # Import local modules
 from data.dataset import PetTrainDataset, PetValidationDataset
 from models.losses import DC_and_CE_loss, DeepSupervisionWrapper
-from models.unet import UNet  # This will be implemented next
+from models.unet import UNet  
 
 
 def parse_args() -> argparse.Namespace:

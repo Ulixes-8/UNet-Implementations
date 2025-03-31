@@ -1,469 +1,423 @@
 """
-UNet implementation using segmentation-models-pytorch 
-with hyperparameters guided by nnU-Net
+UNet implementation based on nnU-Net architecture
+This module implements a UNet model that follows the architecture and hyperparameters
+defined by nnU-Net for the pet segmentation task.
 """
-
-import os
-import yaml
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-
-import segmentation_models_pytorch as smp
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import numpy as np
-import cv2
-from PIL import Image
+import torch.nn.functional as F
+from typing import List, Tuple, Dict, Union, Optional, Type
 
 
-class ModelConfig:
-    """Configuration class to store model hyperparameters."""
-    
-    def __init__(self, config_path: Optional[str] = None):
-        """
-        Initialize the configuration with default values or from a config file.
-        
-        Args:
-            config_path: Optional path to a YAML configuration file
-        """
-        # Default values based on typical nnU-Net configurations
-        self.model_name = "unet"
-        self.encoder_name = "resnet34"  # nnU-Net typically uses a custom encoder, but resnet is a good default
-        self.encoder_weights = "imagenet"  # Pretrained weights
-        self.in_channels = 3  # RGB images
-        self.classes = 3  # background, cat, dog
-        
-        # Training params
-        self.batch_size = 16  # Will be adjusted based on nnU-Net
-        self.patch_size = (512, 512)  # Will be adjusted based on nnU-Net
-        self.num_epochs = 1000
-        self.learning_rate = 1e-4  # Will be adjusted based on nnU-Net
-        self.optimizer = "Adam"
-        self.loss = "dice"  # Will be adjusted based on nnU-Net
-        self.weight_decay = 3e-5
-        
-        # Augmentation params - we'll use our existing augmentation config
-        self.use_augmentation = True
-        
-        # Load from file if provided
-        if config_path is not None:
-            self.load_from_file(config_path)
-    
-    def load_from_file(self, config_path: str) -> None:
-        """
-        Load configuration from a YAML file.
-        
-        Args:
-            config_path: Path to a YAML configuration file
-        """
-        with open(config_path, 'r') as f:
-            config_dict = yaml.safe_load(f)
-        
-        for key, value in config_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-    
-    def save_to_file(self, config_path: str) -> None:
-        """
-        Save the current configuration to a YAML file.
-        
-        Args:
-            config_path: Path to save the YAML configuration
-        """
-        # Create a dictionary of all attributes
-        config_dict = {key: value for key, value in self.__dict__.items()}
-        
-        # Save to file
-        with open(config_path, 'w') as f:
-            yaml.dump(config_dict, f, default_flow_style=False)
-
-
-class PetSegmentationDataset(Dataset):
-    """Dataset class for the Oxford-IIIT Pet segmentation dataset."""
+class ConvBlock(nn.Module):
+    """
+    Basic convolutional block for UNet.
+    This block consists of n_convs convolutional layers, each followed by normalization and activation.
+    """
     
     def __init__(
         self,
-        images_dir: str,
-        masks_dir: str,
-        transform: Optional[A.Compose] = None,
-        is_test: bool = False
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Union[int, Tuple[int, int]],
+        n_convs: int = 2,
+        padding: Optional[int] = None,
+        norm_op: Type[nn.Module] = nn.InstanceNorm2d,
+        norm_op_kwargs: Dict = None,
+        dropout_op: Optional[Type[nn.Module]] = None,
+        dropout_op_kwargs: Dict = None,
+        nonlin: Type[nn.Module] = nn.LeakyReLU,
+        nonlin_kwargs: Dict = None,
+        conv_bias: bool = True
     ):
         """
-        Initialize the dataset.
+        Initialize the ConvBlock.
         
         Args:
-            images_dir: Directory containing images
-            masks_dir: Directory containing mask annotations
-            transform: Albumentations transforms to apply
-            is_test: Whether this is a test dataset
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel
+            stride: Stride of the convolution
+            n_convs: Number of convolutional layers in the block
+            padding: Padding size (if None, calculated to maintain spatial dimensions)
+            norm_op: Normalization operation to use
+            norm_op_kwargs: Arguments for normalization operation
+            dropout_op: Dropout operation to use (if any)
+            dropout_op_kwargs: Arguments for dropout operation
+            nonlin: Non-linear activation function to use
+            nonlin_kwargs: Arguments for non-linear activation
+            conv_bias: Whether to use bias in convolutions
         """
-        self.images_dir = Path(images_dir)
-        self.masks_dir = Path(masks_dir)
-        self.transform = transform
-        self.is_test = is_test
+        super(ConvBlock, self).__init__()
         
-        # Get a list of all image files
-        self.image_files = sorted(list(self.images_dir.glob("*.jpg")))
+        # Default arguments if not provided
+        if norm_op_kwargs is None:
+            norm_op_kwargs = {'eps': 1e-5, 'affine': True}
+        if nonlin_kwargs is None:
+            nonlin_kwargs = {'inplace': True}
+        if dropout_op_kwargs is None:
+            dropout_op_kwargs = {}
         
-        # Ensure there are files in the directory
-        if len(self.image_files) == 0:
-            raise ValueError(f"No image files found in {images_dir}")
-    
-    def __len__(self) -> int:
-        """Return the number of samples in the dataset."""
-        return len(self.image_files)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a sample from the dataset.
+        # Calculate padding if not provided
+        if padding is None:
+            if isinstance(kernel_size, int):
+                padding = kernel_size // 2
+            else:
+                padding = (kernel_size[0] // 2, kernel_size[1] // 2)
         
-        Args:
-            idx: Index of the sample to retrieve
+        # Create the convolutional blocks
+        layers = []
+        current_channels = in_channels
+        
+        for i in range(n_convs):
+            # Only apply stride in the first convolution
+            current_stride = stride if i == 0 else 1
             
-        Returns:
-            Dict containing image and mask tensors
-        """
-        # Get image file path
-        img_path = self.image_files[idx]
+            # Add convolutional layer
+            layers.append(
+                nn.Conv2d(
+                    current_channels,
+                    out_channels,
+                    kernel_size,
+                    current_stride,
+                    padding,
+                    bias=conv_bias
+                )
+            )
+            
+            # Add normalization
+            if norm_op is not None:
+                layers.append(norm_op(out_channels, **norm_op_kwargs))
+            
+            # Add non-linearity
+            if nonlin is not None:
+                layers.append(nonlin(**nonlin_kwargs))
+            
+            # Add dropout if specified
+            if dropout_op is not None:
+                layers.append(dropout_op(**dropout_op_kwargs))
+            
+            # Update current number of channels
+            current_channels = out_channels
         
-        # Get corresponding mask file path
-        mask_path = self.masks_dir / f"{img_path.stem}.png"
-        
-        # Load image and mask
-        image = cv2.imread(str(img_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        if not self.is_test:
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        else:
-            # For test set, create a dummy mask if not available
-            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        
-        # Apply transformations
-        if self.transform:
-            transformed = self.transform(image=image, mask=mask)
-            image = transformed["image"]
-            mask = transformed["mask"]
-        
-        return {"image": image, "mask": mask}
-
-
-class UNetModel:
-    """UNet model wrapper using segmentation-models-pytorch."""
+        # Create the sequential block
+        self.block = nn.Sequential(*layers)
     
-    def __init__(self, config: ModelConfig):
+    def forward(self, x):
+        """Forward pass of the convolutional block."""
+        return self.block(x)
+
+
+class UpBlock(nn.Module):
+    """
+    Upsampling block for the decoder part of UNet.
+    This block upsamples the feature maps and concatenates with skip connections.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        n_convs: int = 2,
+        norm_op: Type[nn.Module] = nn.InstanceNorm2d,
+        norm_op_kwargs: Dict = None,
+        dropout_op: Optional[Type[nn.Module]] = None,
+        dropout_op_kwargs: Dict = None,
+        nonlin: Type[nn.Module] = nn.LeakyReLU,
+        nonlin_kwargs: Dict = None,
+        conv_bias: bool = True
+    ):
+        """
+        Initialize the UpBlock.
+        
+        Args:
+            in_channels: Number of input channels from the lower level
+            skip_channels: Number of channels from the skip connection
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel
+            n_convs: Number of convolutional layers in the block
+            norm_op: Normalization operation to use
+            norm_op_kwargs: Arguments for normalization operation
+            dropout_op: Dropout operation to use (if any)
+            dropout_op_kwargs: Arguments for dropout operation
+            nonlin: Non-linear activation function to use
+            nonlin_kwargs: Arguments for non-linear activation
+            conv_bias: Whether to use bias in convolutions
+        """
+        super(UpBlock, self).__init__()
+        
+        # Create the convolution block
+        self.conv_block = ConvBlock(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size,
+            stride=1,
+            n_convs=n_convs,
+            padding=None,
+            norm_op=norm_op,
+            norm_op_kwargs=norm_op_kwargs,
+            dropout_op=dropout_op,
+            dropout_op_kwargs=dropout_op_kwargs,
+            nonlin=nonlin,
+            nonlin_kwargs=nonlin_kwargs,
+            conv_bias=conv_bias
+        )
+    
+    def forward(self, x, skip):
+        """
+        Forward pass of the upsampling block.
+        
+        Args:
+            x: Input feature maps from lower level
+            skip: Feature maps from skip connection
+        
+        Returns:
+            Output feature maps
+        """
+        # Upsample the input to match skip connection size
+        x_shape = x.shape[2:]
+        skip_shape = skip.shape[2:]
+        
+        # Compute upsampling size to match skip connection
+        if x_shape[0] != skip_shape[0] or x_shape[1] != skip_shape[1]:
+            x = F.interpolate(
+                x,
+                size=skip_shape,
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        # Concatenate with skip connection
+        x = torch.cat([x, skip], dim=1)
+        
+        # Apply convolution block
+        return self.conv_block(x)
+
+
+class UNet(nn.Module):
+    """
+    UNet model for semantic segmentation, based on nnU-Net architecture.
+    This implementation follows the nnU-Net architecture with configurable hyperparameters.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        num_classes: int = 3,
+        n_stages: int = 8,
+        features_per_stage: List[int] = None,
+        kernel_sizes: List[Tuple[int, int]] = None,
+        strides: List[Tuple[int, int]] = None,
+        n_conv_per_stage: List[int] = None,
+        n_conv_per_stage_decoder: List[int] = None,
+        conv_bias: bool = True,
+        norm_op: Type[nn.Module] = nn.InstanceNorm2d,
+        norm_op_kwargs: Dict = None,
+        dropout_op: Optional[Type[nn.Module]] = None,
+        dropout_op_kwargs: Dict = None,
+        nonlin: Type[nn.Module] = nn.LeakyReLU,
+        nonlin_kwargs: Dict = None,
+        deep_supervision: bool = True
+    ):
         """
         Initialize the UNet model.
         
         Args:
-            config: Model configuration
+            in_channels: Number of input channels (3 for RGB images)
+            num_classes: Number of output classes (3 for background, cat, dog)
+            n_stages: Number of stages in the encoder
+            features_per_stage: Number of features per stage
+            conv_op: Convolution operation to use
+            kernel_sizes: Kernel sizes for each stage
+            strides: Strides for each stage
+            n_conv_per_stage: Number of convolutions per encoder stage
+            n_conv_per_stage_decoder: Number of convolutions per decoder stage
+            conv_bias: Whether to use bias in convolutions
+            norm_op: Normalization operation to use
+            norm_op_kwargs: Arguments for normalization operation
+            dropout_op: Dropout operation to use (if any)
+            dropout_op_kwargs: Arguments for dropout operation
+            nonlin: Non-linear activation function to use
+            nonlin_kwargs: Arguments for non-linear activation
+            deep_supervision: Whether to use deep supervision
         """
-        self.config = config
+        super(UNet, self).__init__()
         
-        # Initialize model
-        self.model = self._create_model()
+        # Set default values for parameters if not provided
+        if features_per_stage is None:
+            features_per_stage = [32, 64, 128, 256, 512, 512, 512, 512]
         
-        # Set device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else 
-                                  ("mps" if torch.backends.mps.is_available() else "cpu"))
-        self.model = self.model.to(self.device)
+        if kernel_sizes is None:
+            kernel_sizes = [[3, 3]] * n_stages
         
-        # Initialize loss function
-        self.loss_fn = self._create_loss()
+        if strides is None:
+            strides = [[1, 1]] + [[2, 2]] * (n_stages - 1)
         
-        # Initialize optimizer
-        self.optimizer = self._create_optimizer()
+        if n_conv_per_stage is None:
+            n_conv_per_stage = [2] * n_stages
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=10, verbose=True
-        )
-    
-    def _create_model(self) -> nn.Module:
-        """
-        Create and return the UNet model.
+        if n_conv_per_stage_decoder is None:
+            n_conv_per_stage_decoder = [2] * (n_stages - 1)
         
-        Returns:
-            PyTorch model
-        """
-        return smp.Unet(
-            encoder_name=self.config.encoder_name,
-            encoder_weights=self.config.encoder_weights,
-            in_channels=self.config.in_channels,
-            classes=self.config.classes,
-            activation=None  # We'll apply softmax in the loss function
-        )
-    
-    def _create_loss(self) -> nn.Module:
-        """
-        Create and return the loss function.
+        if norm_op_kwargs is None:
+            norm_op_kwargs = {'eps': 1e-5, 'affine': True}
         
-        Returns:
-            PyTorch loss function
-        """
-        if self.config.loss == "dice":
-            return smp.losses.DiceLoss(mode='multiclass')
-        elif self.config.loss == "ce":
-            return nn.CrossEntropyLoss()
-        elif self.config.loss == "combined":
-            return smp.losses.DiceLoss(mode='multiclass') + nn.CrossEntropyLoss()
-        else:
-            raise ValueError(f"Unsupported loss function: {self.config.loss}")
-    
-    def _create_optimizer(self) -> torch.optim.Optimizer:
-        """
-        Create and return the optimizer.
+        if nonlin_kwargs is None:
+            nonlin_kwargs = {'inplace': True}
         
-        Returns:
-            PyTorch optimizer
-        """
-        if self.config.optimizer == "Adam":
-            return optim.Adam(
-                self.model.parameters(),
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay
+        # Store parameters
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.n_stages = n_stages
+        self.features_per_stage = features_per_stage
+        self.deep_supervision = deep_supervision
+        
+        # Create encoder stages
+        self.encoder_stages = nn.ModuleList()
+        
+        current_channels = in_channels
+        
+        for stage in range(n_stages):
+            # Create encoder block
+            self.encoder_stages.append(
+                ConvBlock(
+                    current_channels,
+                    features_per_stage[stage],
+                    kernel_sizes[stage],
+                    strides[stage],
+                    n_convs=n_conv_per_stage[stage],
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    dropout_op=dropout_op,
+                    dropout_op_kwargs=dropout_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    conv_bias=conv_bias
+                )
             )
-        elif self.config.optimizer == "SGD":
-            return optim.SGD(
-                self.model.parameters(),
-                lr=self.config.learning_rate,
-                momentum=0.9,
-                weight_decay=self.config.weight_decay
+            
+            # Update current channels
+            current_channels = features_per_stage[stage]
+        
+        # Create decoder stages
+        self.decoder_stages = nn.ModuleList()
+        
+        for stage in range(n_stages - 1):
+            # Decoder stage goes in reverse order
+            decoder_idx = n_stages - 2 - stage
+            
+            # Create decoder block
+            self.decoder_stages.append(
+                UpBlock(
+                    features_per_stage[decoder_idx + 1],
+                    features_per_stage[decoder_idx],
+                    features_per_stage[decoder_idx],
+                    kernel_sizes[decoder_idx],
+                    n_convs=n_conv_per_stage_decoder[decoder_idx],
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    dropout_op=dropout_op,
+                    dropout_op_kwargs=dropout_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    conv_bias=conv_bias
+                )
             )
-        else:
-            raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
-    
-    def save_checkpoint(self, path: str, epoch: int, best_metric: float) -> None:
-        """
-        Save model checkpoint.
         
-        Args:
-            path: Path to save the checkpoint
-            epoch: Current epoch
-            best_metric: Best validation metric achieved so far
-        """
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_metric': best_metric,
-            'config': self.config.__dict__
-        }
-        torch.save(checkpoint, path)
-    
-    def load_checkpoint(self, path: str) -> Tuple[int, float]:
-        """
-        Load model checkpoint.
+        # Create output layers for deep supervision
+        self.segmentation_outputs = nn.ModuleList()
         
-        Args:
-            path: Path to the checkpoint file
-            
-        Returns:
-            Tuple of (epoch, best_metric)
-        """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        return checkpoint['epoch'], checkpoint['best_metric']
-    
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """
-        Train for one epoch.
-        
-        Args:
-            train_loader: DataLoader for training data
-            
-        Returns:
-            Dict with training metrics
-        """
-        self.model.train()
-        running_loss = 0.0
-        
-        for batch in train_loader:
-            images = batch['image'].to(self.device)
-            masks = batch['mask'].to(self.device)
-            
-            # Forward pass
-            outputs = self.model(images)
-            loss = self.loss_fn(outputs, masks)
-            
-            # Backward pass and optimize
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            running_loss += loss.item()
-        
-        return {'loss': running_loss / len(train_loader)}
-    
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """
-        Validate the model.
-        
-        Args:
-            val_loader: DataLoader for validation data
-            
-        Returns:
-            Dict with validation metrics
-        """
-        self.model.eval()
-        running_loss = 0.0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                images = batch['image'].to(self.device)
-                masks = batch['mask'].to(self.device)
+        if deep_supervision:
+            # Create multiple output layers for different resolutions
+            for stage in range(n_stages - 1):
+                # Output stage goes in reverse order
+                output_idx = n_stages - 2 - stage
                 
-                # Forward pass
-                outputs = self.model(images)
-                loss = self.loss_fn(outputs, masks)
-                
-                running_loss += loss.item()
+                # Create output convolution
+                self.segmentation_outputs.append(
+                    nn.Conv2d(
+                        features_per_stage[output_idx],
+                        num_classes,
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        bias=True
+                    )
+                )
+        else:
+            # Just one output layer from the final decoder stage
+            self.segmentation_outputs.append(
+                nn.Conv2d(
+                    features_per_stage[0],
+                    num_classes,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True
+                )
+            )
         
-        return {'val_loss': running_loss / len(val_loader)}
+        # Initialize weights
+        self.initialize_weights()
     
-    def predict(self, image: np.ndarray) -> np.ndarray:
+    def initialize_weights(self):
+        """Initialize the weights of the network."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.InstanceNorm2d):
+                if m.weight is not None:
+                    nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
         """
-        Make prediction for a single image.
+        Forward pass of the UNet model.
         
         Args:
-            image: Input image as numpy array (H, W, C)
+            x: Input tensor of shape (batch_size, in_channels, height, width)
             
         Returns:
-            Prediction mask as numpy array (H, W)
+            output: Output tensor or list of output tensors if deep supervision is used
         """
-        self.model.eval()
+        # Store skip connections
+        skip_connections = []
         
-        # Preprocess the image
-        transform = A.Compose([
-            A.Resize(height=self.config.patch_size[0], width=self.config.patch_size[1]),
-            A.Normalize(),
-            ToTensorV2()
-        ])
+        # Encoder path
+        for stage in self.encoder_stages[:-1]:  # All but the last stage
+            x = stage(x)
+            skip_connections.append(x)
         
-        transformed = transform(image=image)
-        image_tensor = transformed["image"].unsqueeze(0).to(self.device)
+        # Bottom stage (without skip connection)
+        x = self.encoder_stages[-1](x)
         
-        # Make prediction
-        with torch.no_grad():
-            output = self.model(image_tensor)
-            output = torch.softmax(output, dim=1)
-            prediction = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+        # Decoder path
+        outputs = []
         
-        # Resize back to original size if needed
-        if image.shape[:2] != prediction.shape:
-            prediction = cv2.resize(
-                prediction.astype(np.uint8), 
-                (image.shape[1], image.shape[0]), 
-                interpolation=cv2.INTER_NEAREST
-            )
+        for idx, decoder_stage in enumerate(self.decoder_stages):
+            # Use the appropriate skip connection (in reverse order)
+            skip_idx = len(skip_connections) - 1 - idx
+            skip = skip_connections[skip_idx]
+            
+            # Decoder block
+            x = decoder_stage(x, skip)
+            
+            # Save output for deep supervision
+            if self.deep_supervision:
+                output = self.segmentation_outputs[idx](x)
+                outputs.append(output)
         
-        return prediction
-
-
-def create_transforms(config: ModelConfig, is_train: bool = True) -> A.Compose:
-    """
-    Create Albumentations transforms.
-    
-    Args:
-        config: Model configuration
-        is_train: Whether to create transforms for training or validation
-        
-    Returns:
-        Albumentations Compose object
-    """
-    if is_train and config.use_augmentation:
-        transforms = A.Compose([
-            A.Resize(height=config.patch_size[0], width=config.patch_size[1]),
-            A.HorizontalFlip(p=0.5),
-            A.ShiftScaleRotate(
-                shift_limit=0.1, 
-                scale_limit=0.15, 
-                rotate_limit=15, 
-                p=0.5,
-                border_mode=cv2.BORDER_CONSTANT
-            ),
-            A.RandomBrightnessContrast(p=0.5),
-            A.Normalize(),
-            ToTensorV2()
-        ])
-    else:
-        transforms = A.Compose([
-            A.Resize(height=config.patch_size[0], width=config.patch_size[1]),
-            A.Normalize(),
-            ToTensorV2()
-        ])
-    
-    return transforms
-
-
-def train_model(
-    model: UNetModel,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    output_dir: str,
-    num_epochs: int = None
-) -> None:
-    """
-    Train the model.
-    
-    Args:
-        model: UNetModel instance
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        output_dir: Directory to save checkpoints
-        num_epochs: Number of epochs to train (overrides config if provided)
-    """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get number of epochs
-    if num_epochs is None:
-        num_epochs = model.config.num_epochs
-    
-    # Initialize training variables
-    best_val_loss = float('inf')
-    
-    # Training loop
-    for epoch in range(num_epochs):
-        train_metrics = model.train_epoch(train_loader)
-        val_metrics = model.validate(val_loader)
-        
-        # Update learning rate
-        model.scheduler.step(val_metrics['val_loss'])
-        
-        # Save best model
-        if val_metrics['val_loss'] < best_val_loss:
-            best_val_loss = val_metrics['val_loss']
-            model.save_checkpoint(
-                os.path.join(output_dir, 'best_model.pth'),
-                epoch,
-                best_val_loss
-            )
-        
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            model.save_checkpoint(
-                os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth'),
-                epoch,
-                best_val_loss
-            )
-        
-        # Print progress
-        print(f"Epoch {epoch+1}/{num_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} | "
-              f"Val Loss: {val_metrics['val_loss']:.4f}")
-    
-    # Save final model
-    model.save_checkpoint(
-        os.path.join(output_dir, 'final_model.pth'),
-        num_epochs - 1,
-        best_val_loss
-    )
+        # Final output
+        if self.deep_supervision:
+            # Return outputs in the correct order (largest to smallest)
+            return outputs[::-1]
+        else:
+            # Just return the final output
+            return self.segmentation_outputs[0](x)

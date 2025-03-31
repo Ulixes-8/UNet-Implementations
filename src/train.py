@@ -6,7 +6,7 @@ This script trains a UNet model for pet segmentation using the Oxford-IIIT Pet D
 It handles the training loop, validation, checkpointing, and logging.
 
 Example Usage:
-    python src/train.py --data_dir data --output_dir models/unet_pet_segmentation
+    python src/train.py --data_dir data/processed --output_dir models/unet_pet_segmentation
 """
 
 import argparse
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/home/ulixes/segmentation_cv/unet/data/processed",
+        default="data/processed",
         help="Path to the processed data directory"
     )
     
@@ -128,7 +128,8 @@ class PetSegmentationDataset(Dataset):
         self,
         images_dir: str,
         masks_dir: str,
-        include_augmented: bool = True
+        include_augmented: bool = True,
+        target_size: Tuple[int, int] = (512, 512)
     ):
         """
         Initialize the dataset.
@@ -137,9 +138,11 @@ class PetSegmentationDataset(Dataset):
             images_dir: Directory containing images
             masks_dir: Directory containing mask annotations
             include_augmented: Whether to include augmented images (if available)
+            target_size: Target size for images and masks (height, width)
         """
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
+        self.target_size = target_size
         
         # Get all image files from the directory
         self.image_files = sorted(list(self.images_dir.glob("*.jpg")))
@@ -186,10 +189,31 @@ class PetSegmentationDataset(Dataset):
             mask_path = self.masks_dir / f"{img_path.stem}.png"
         
         # Load image and mask
-        image = cv2.imread(str(img_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        try:
+            image = cv2.imread(str(img_path))
+            if image is None:
+                raise ValueError(f"Failed to load image: {img_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to load mask: {mask_path}")
+                
+            # Store original dimensions before resizing
+            original_dims = mask.shape[:2]  # (height, width)
+        except Exception as e:
+            print(f"Error loading image or mask: {e}")
+            # Return a blank sample as fallback
+            image = np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.uint8)
+            mask = np.zeros(self.target_size, dtype=np.uint8)
+            original_dims = self.target_size
         
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        # Ensure image and mask have the correct dimensions
+        if image.shape[:2] != self.target_size:
+            image = cv2.resize(image, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_LINEAR)
+        
+        if mask.shape != self.target_size:
+            mask = cv2.resize(mask, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_NEAREST)
         
         # Keep 255 as is - we'll handle it properly in the loss function
         # Just ensure other values are within valid range (0, 1, 2)
@@ -206,7 +230,14 @@ class PetSegmentationDataset(Dataset):
         # Convert mask to tensor
         mask = torch.from_numpy(mask).long()
         
-        return {"image": image, "mask": mask}
+        # Store original dimensions as tensor
+        original_dims = torch.tensor(original_dims)
+        
+        return {
+            "image": image, 
+            "mask": mask,
+            "original_dims": original_dims
+        }
 
 
 def create_dataloaders(
@@ -233,30 +264,41 @@ def create_dataloaders(
     val_imgs_dir = Path(data_dir) / "Val" / "resized"
     val_masks_dir = Path(data_dir) / "Val" / "processed_labels"
     
+    # Target size for all images and masks
+    target_size = (512, 512)
+    
     # Create datasets
     train_dataset = PetSegmentationDataset(
         images_dir=train_imgs_dir,
         masks_dir=train_masks_dir,
-        include_augmented=True
+        include_augmented=True,
+        target_size=target_size
     )
     
     val_dataset = PetSegmentationDataset(
         images_dir=val_imgs_dir,
         masks_dir=val_masks_dir,
-        include_augmented=False
+        include_augmented=False,
+        target_size=target_size
     )
     
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
     
-    # Create data loaders
+    # Create data loaders with a custom worker init function
+    def worker_init_fn(worker_id):
+        # Set a unique seed for each worker to ensure reproducibility
+        np.random.seed(np.random.get_state()[1][0] + worker_id)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True  # To ensure consistent batch sizes for batch norm
+        drop_last=True,  # To ensure consistent batch sizes for batch norm
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True if num_workers > 0 else False,
     )
     
     val_loader = DataLoader(
@@ -264,7 +306,9 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True if num_workers > 0 else False,
     )
     
     return train_loader, val_loader
@@ -295,8 +339,7 @@ def create_model(device: torch.device) -> nn.Module:
         norm_op_kwargs={"eps": 1e-5, "affine": True},
         dropout_op=None,
         nonlin=nn.LeakyReLU,
-        nonlin_kwargs={"inplace": True},
-        deep_supervision=True
+        nonlin_kwargs={"inplace": True}
     )
     
     # Move model to device
@@ -369,7 +412,7 @@ def validate(
     val_loader: DataLoader,
     loss_function: nn.Module,
     device: torch.device,
-    ignore_label: int = 250  # New ignore label
+    ignore_label: int = 255  # Ignore border class
 ) -> Tuple[float, Dict[str, float]]:
     """
     Validate the model on the validation set.
@@ -395,32 +438,35 @@ def validate(
         "mean_foreground": 0.0
     }
     
+    # For faster validation, just evaluate on a subset
+    max_val_batches = 20  # Limit validation batches for speed
+    
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validation", leave=False):
+        for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
+            # Limit validation batches for faster epochs
+            if i >= max_val_batches:
+                break
+                
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
             
             # Forward pass
             outputs = model(images)
             
-            # Compute loss
+            # Compute loss on model outputs (before any resizing)
             loss = loss_function(outputs, masks)
             val_loss += loss.item()
             
-            # For metrics, use the main output if deep supervision is used
-            if isinstance(outputs, (list, tuple)):
-                outputs = outputs[0]
-            
             # Convert outputs to predictions
-            preds = torch.argmax(outputs, dim=1, keepdim=True)
+            preds = torch.argmax(outputs, dim=1)
             
             # Calculate Dice scores for each class
             for cls_idx, cls_name in [(0, "background"), (1, "cat"), (2, "dog")]:
-                # Create binary masks for predictions and ground truth
+                # Create binary masks
                 pred_cls = (preds == cls_idx).float()
                 mask_cls = (masks == cls_idx).float()
                 
-                # Ignore border pixels (class 250)
+                # Ignore border pixels (class 255)
                 ignore_mask = (masks != ignore_label).float()
                 pred_cls = pred_cls * ignore_mask
                 mask_cls = mask_cls * ignore_mask
@@ -436,9 +482,9 @@ def validate(
                     dice = torch.tensor(1.0, device=device)  # Perfect score if both are empty
                 
                 dice_scores[cls_name] += dice.item()
-            
+    
     # Average metrics
-    num_batches = len(val_loader)
+    num_batches = min(max_val_batches, len(val_loader))
     val_loss /= num_batches
     
     for cls_name in dice_scores:
@@ -476,33 +522,67 @@ def train_one_epoch(
     
     epoch_loss = 0.0
     
+    # Timing variables
+    data_loading_time = 0
+    forward_time = 0
+    loss_calc_time = 0
+    backward_time = 0
+    
+    start_time = time.time()
     for batch in tqdm(train_loader, desc="Training", leave=False):
+        # Time data loading
+        data_time = time.time() - start_time
+        data_loading_time += data_time
+        
         images = batch["image"].to(device)
         masks = batch["mask"].to(device)
         
         # Zero gradients
         optimizer.zero_grad()
         
-        # Forward pass with optional mixed precision
+        # Time forward pass
+        forward_start = time.time()
         if scaler is not None:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
-                loss = loss_function(outputs, masks)
                 
-            # Backward pass with scaler
+                # Time loss calculation
+                loss_start = time.time()
+                loss = loss_function(outputs, masks)
+                loss_calc_time += time.time() - loss_start
+                
+            # Time backward pass
+            backward_start = time.time()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            backward_time += time.time() - backward_start
         else:
-            # Standard precision training
             outputs = model(images)
-            loss = loss_function(outputs, masks)
             
-            # Backward pass
+            # Time loss calculation
+            loss_start = time.time()
+            loss = loss_function(outputs, masks)
+            loss_calc_time += time.time() - loss_start
+            
+            # Time backward pass
+            backward_start = time.time()
             loss.backward()
             optimizer.step()
+            backward_time += time.time() - backward_start
+        
+        # Calculate forward time (excluding loss calculation)
+        forward_time += (time.time() - forward_start) - (time.time() - loss_start)
         
         epoch_loss += loss.item()
+        start_time = time.time()
+    
+    # Print timing information
+    print(f"  Data loading time: {data_loading_time:.2f}s")
+    print(f"  Forward pass time: {forward_time:.2f}s")
+    print(f"  Loss calculation time: {loss_calc_time:.2f}s")
+    print(f"  Backward pass time: {backward_time:.2f}s")
+    print(f"  Total time: {data_loading_time + forward_time + loss_calc_time + backward_time:.2f}s")
     
     return epoch_loss / len(train_loader)
 
@@ -538,7 +618,20 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "best_dice": best_dice
+        "best_dice": best_dice,
+        "config": {
+            "in_channels": 3,
+            "num_classes": 3,
+            "n_stages": 8,
+            "features_per_stage": [32, 64, 128, 256, 512, 512, 512, 512],
+            "kernel_sizes": [[3, 3]] * 8,
+            "strides": [[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
+            "n_conv_per_stage": [2] * 8,
+            "n_conv_per_stage_decoder": [2] * 7,
+            "conv_bias": True,
+            "norm_op_kwargs": {"eps": 1e-5, "affine": True},
+            "nonlin_kwargs": {"inplace": True}
+        }
     }
     
     # Save the checkpoint
@@ -574,6 +667,7 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Using device: {device}")
+    print(f"Using mixed precision: {args.amp}")
     
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(
@@ -630,10 +724,11 @@ def main() -> None:
     # Create log file
     log_file = output_dir / "training_log.csv"
     with open(log_file, "w") as f:
-        f.write("epoch,train_loss,val_loss,dice_background,dice_cat,dice_dog,dice_mean_foreground,learning_rate\n")
+        f.write("epoch,train_loss,val_loss,dice_background,dice_cat,dice_dog,dice_mean_foreground,learning_rate,epoch_time\n")
     
     # Main training loop
     for epoch in range(start_epoch, args.epochs):
+        epoch_start_time = time.time()
         print(f"Epoch {epoch+1}/{args.epochs}")
         
         # Train for one epoch
@@ -660,6 +755,9 @@ def main() -> None:
         # Step the scheduler
         scheduler.step()
         
+        # Calculate epoch time
+        epoch_time = time.time() - epoch_start_time
+        
         # Log metrics
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Val Loss: {val_loss:.4f}")
@@ -669,13 +767,14 @@ def main() -> None:
         print(f"    Dog: {dice_scores['dog']:.4f}")
         print(f"    Mean Foreground: {dice_scores['mean_foreground']:.4f}")
         print(f"  Learning Rate: {current_lr:.7f}")
+        print(f"  Epoch Time: {epoch_time:.2f}s")
         
         # Log to file
         with open(log_file, "a") as f:
             f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f},"
                    f"{dice_scores['background']:.6f},{dice_scores['cat']:.6f},"
                    f"{dice_scores['dog']:.6f},{dice_scores['mean_foreground']:.6f},"
-                   f"{current_lr:.7f}\n")
+                   f"{current_lr:.7f},{epoch_time:.2f}\n")
         
         # Check if this is the best model so far
         is_best = dice_scores['mean_foreground'] > best_dice

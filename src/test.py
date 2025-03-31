@@ -1,67 +1,105 @@
 #!/usr/bin/env python
 """
-Simple test script to verify the SimpleLoss function works correctly.
+Test script for UNet model.
+This script creates a UNet model with the specified hyperparameters
+and runs a forward pass with a test input to ensure it works properly.
 """
 
 import torch
-from models.losses import SimpleLoss, DeepSupervisionWrapper
+import torch.nn as nn
+import numpy as np
+from models.unet import UNet
+from models.losses import SimpleLoss
 
-def test_simple_loss():
+def test_unet():
+    """Test the UNet model and loss function."""
+    print("Testing UNet model...")
+    
     # Set random seed for reproducibility
     torch.manual_seed(42)
     
-    # Create dummy data
-    batch_size = 2
-    num_classes = 3  # Background, cat, dog
-    height, width = 16, 16
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # Create random prediction logits
-    predictions = torch.randn(batch_size, num_classes, height, width)
+    # Create model
+    model = UNet(
+        in_channels=3,
+        num_classes=3,
+        n_stages=8,
+        features_per_stage=[32, 64, 128, 256, 512, 512, 512, 512],
+        kernel_sizes=[[3, 3]] * 8,
+        strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
+        n_conv_per_stage=[2] * 8,
+        n_conv_per_stage_decoder=[2] * 7,
+        conv_bias=True,
+        norm_op=nn.InstanceNorm2d,
+        norm_op_kwargs={"eps": 1e-5, "affine": True},
+        dropout_op=None,
+        nonlin=nn.LeakyReLU,
+        nonlin_kwargs={"inplace": True}
+    )
     
-    # Create target with some border pixels
-    target = torch.zeros(batch_size, height, width, dtype=torch.long)
+    # Move model to device
+    model = model.to(device)
     
-    # Add some foreground classes
-    target[:, 4:8, 4:8] = 1  # Add class 1 (cat)
-    target[:, 10:14, 10:14] = 2  # Add class 2 (dog)
-    
-    # Add some border pixels (255)
-    target[:, 0:2, :] = 255  # Top border
-    target[:, -2:, :] = 255  # Bottom border
-    target[:, :, 0:2] = 255  # Left border
-    target[:, :, -2:] = 255  # Right border
-    
-    print(f"Target shape: {target.shape}")
-    print(f"Predictions shape: {predictions.shape}")
-    print(f"Number of border pixels: {(target == 255).sum().item()}")
+    # Print model summary
+    print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     
     # Create loss function
-    print("Creating loss functions...")
     loss_fn = SimpleLoss(weight_dice=1.0, weight_ce=1.0, ignore_index=255)
-    deep_loss_fn = DeepSupervisionWrapper(loss_fn)
     
-    # Calculate loss
-    print("Calculating loss...")
-    loss = loss_fn(predictions, target)
-    print(f"Loss value: {loss.item()}")
+    # Create dummy input
+    batch_size = 2
+    input_shape = (batch_size, 3, 512, 512)
+    input_tensor = torch.randn(input_shape, device=device)
     
-    # Test with gradients
-    predictions.requires_grad = True
-    loss = loss_fn(predictions, target)
-    print(f"Loss with grad: {loss.item()}")
+    # Create dummy target (with some border pixels)
+    target_shape = (batch_size, 512, 512)
+    target_tensor = torch.zeros(target_shape, dtype=torch.long, device=device)
     
-    # Test backward pass
-    print("Testing backward pass...")
-    loss.backward()
-    print("Backward pass successful!")
+    # Add some foreground classes
+    target_tensor[:, 100:200, 100:200] = 1  # Class 1 (cat)
+    target_tensor[:, 300:400, 300:400] = 2  # Class 2 (dog)
     
-    # Test with deep supervision
-    print("Testing deep supervision...")
-    deep_outputs = [predictions, predictions.detach().clone()]
-    deep_loss = deep_loss_fn(deep_outputs, target)
-    print(f"Deep supervision loss: {deep_loss.item()}")
+    # Add border pixels (255)
+    target_tensor[:, :10, :] = 255
+    target_tensor[:, -10:, :] = 255
     
-    print("All tests passed!")
+    # Print shapes
+    print(f"Input shape: {input_tensor.shape}")
+    print(f"Target shape: {target_tensor.shape}")
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Forward pass
+    with torch.no_grad():
+        try:
+            output = model(input_tensor)
+            print(f"Output shape: {output.shape}")
+            
+            # Verify output dimensions
+            assert output.shape == (batch_size, 3, 512, 512), "Output shape doesn't match expected shape"
+            print("Output shape verification: PASSED")
+            
+            # Calculate loss
+            loss = loss_fn(output, target_tensor)
+            print(f"Loss: {loss.item()}")
+            
+            # Test with gradient
+            model.train()
+            output = model(input_tensor)
+            loss = loss_fn(output, target_tensor)
+            loss.backward()
+            print("Backward pass: PASSED")
+            
+            print("All tests PASSED!")
+            return True
+            
+        except Exception as e:
+            print(f"Error during testing: {e}")
+            return False
 
 if __name__ == "__main__":
-    test_simple_loss()
+    test_unet()

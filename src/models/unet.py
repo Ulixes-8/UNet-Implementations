@@ -1,5 +1,5 @@
 """
-UNet implementation based on nnU-Net architecture
+UNet implementation for pet segmentation
 This module implements a UNet model that follows the architecture and hyperparameters
 defined by nnU-Net for the pet segmentation task.
 """
@@ -220,8 +220,7 @@ class UNet(nn.Module):
         dropout_op: Optional[Type[nn.Module]] = None,
         dropout_op_kwargs: Dict = None,
         nonlin: Type[nn.Module] = nn.LeakyReLU,
-        nonlin_kwargs: Dict = None,
-        deep_supervision: bool = False
+        nonlin_kwargs: Dict = None
     ):
         """
         Initialize the UNet model.
@@ -243,7 +242,6 @@ class UNet(nn.Module):
             dropout_op_kwargs: Arguments for dropout operation
             nonlin: Non-linear activation function to use
             nonlin_kwargs: Arguments for non-linear activation
-            deep_supervision: Whether to use deep supervision
         """
         super(UNet, self).__init__()
         
@@ -274,7 +272,6 @@ class UNet(nn.Module):
         self.num_classes = num_classes
         self.n_stages = n_stages
         self.features_per_stage = features_per_stage
-        self.deep_supervision = deep_supervision
         
         # Create encoder stages
         self.encoder_stages = nn.ModuleList()
@@ -328,38 +325,15 @@ class UNet(nn.Module):
                 )
             )
         
-        # Create output layers for deep supervision
-        self.segmentation_outputs = nn.ModuleList()
-        
-        if deep_supervision:
-            # Create multiple output layers for different resolutions
-            for stage in range(n_stages - 1):
-                # Output stage goes in reverse order
-                output_idx = n_stages - 2 - stage
-                
-                # Create output convolution
-                self.segmentation_outputs.append(
-                    nn.Conv2d(
-                        features_per_stage[output_idx],
-                        num_classes,
-                        kernel_size=1,
-                        stride=1,
-                        padding=0,
-                        bias=True
-                    )
-                )
-        else:
-            # Just one output layer from the final decoder stage
-            self.segmentation_outputs.append(
-                nn.Conv2d(
-                    features_per_stage[0],
-                    num_classes,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    bias=True
-                )
-            )
+        # Create final segmentation output layer
+        self.segmentation_output = nn.Conv2d(
+            features_per_stage[0],  # First decoder stage features
+            num_classes,           # Number of output classes
+            kernel_size=1,         # 1x1 convolution
+            stride=1,
+            padding=0,
+            bias=True
+        )
         
         # Initialize weights
         self.initialize_weights()
@@ -407,5 +381,7 @@ class UNet(nn.Module):
             # Decoder block
             x = decoder_stage(x, skip)
         
-        # Return only the final output (no deep supervision)
-        return self.segmentation_outputs[0](x)
+        # Final 1x1 convolution to produce segmentation map
+        output = self.segmentation_output(x)
+        
+        return output

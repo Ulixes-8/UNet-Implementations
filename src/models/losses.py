@@ -32,7 +32,7 @@ class SimpleLoss(nn.Module):
         return self.weight_ce * ce_loss + self.weight_dice * dice_loss
     
     def _dice_loss(self, input, target):
-        # Create a mask for valid pixels (not ignore_index)
+        # Create a mask for valid pixels (not ignore_index/border class)
         mask = (target != self.ignore_index).float()
         
         # Get the number of classes
@@ -44,8 +44,8 @@ class SimpleLoss(nn.Module):
         # Initialize dice loss
         dice_loss = 0
         
-        # Calculate dice loss for each class (skip background class 0)
-        for c in range(1, num_classes):
+        # Calculate dice loss for each class (including background class 0)
+        for c in range(num_classes):  # Include background class
             # Create binary target for current class
             target_c = (target == c).float()
             
@@ -67,5 +67,5 @@ class SimpleLoss(nn.Module):
             # Add to total dice loss (1 - dice for minimization)
             dice_loss += (1.0 - dice.mean())
         
-        # Average over number of classes (excluding background)
-        return dice_loss / (num_classes - 1)
+        # Average over number of classes (including background)
+        return dice_loss / num_classes

@@ -25,7 +25,7 @@ import cv2
 from tqdm import tqdm
 
 # Import local modules
-from models.losses import DC_and_CE_loss, DeepSupervisionWrapper
+from models.losses import SimpleLoss
 from models.unet import UNet
 
 
@@ -191,12 +191,9 @@ class PetSegmentationDataset(Dataset):
         
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         
-        # Convert 255 (ignore label) to 250 (a new ignore label that won't cause index errors)
-        # This is a simpler approach to handle invalid indices in the loss function
-        mask = np.where(mask == 255, 250, mask)
-        
-        # Ensure other values are within valid range (0, 1, 2)
-        mask = np.where((mask > 2) & (mask != 250), 0, mask)
+        # Keep 255 as is - we'll handle it properly in the loss function
+        # Just ensure other values are within valid range (0, 1, 2)
+        mask = np.where((mask > 2) & (mask != 255), 0, mask)
         
         # Convert image to tensor and normalize (0-1)
         image = torch.from_numpy(image).float().permute(2, 0, 1) / 255.0
@@ -357,32 +354,14 @@ def create_lr_scheduler(optimizer: optim.Optimizer, max_epochs: int) -> optim.lr
     return scheduler
 
 
-def get_loss_function() -> nn.Module:
-    """
-    Create the loss function with deep supervision wrapper.
-    
-    Returns:
-        Configured loss function
-    """
-    # Set up Dice and Cross-Entropy loss
-    soft_dice_kwargs = {
-        'batch_dice': True,
-        'do_bg': False,  # Don't include background in Dice
-        'smooth': 1e-5
-    }
-    
-    ce_kwargs = {}
-    
-    # Create combined loss
-    loss_func = DC_and_CE_loss(
-        soft_dice_kwargs=soft_dice_kwargs,
-        ce_kwargs=ce_kwargs
+def get_loss_function():
+    """Create a simple loss function (Dice + Cross Entropy)."""
+    return SimpleLoss(
+        weight_dice=1.0,
+        weight_ce=1.0,
+        ignore_index=255,
+        smooth=1e-5
     )
-    
-    # Wrap with deep supervision
-    loss_func = DeepSupervisionWrapper(loss_func)
-    
-    return loss_func
 
 
 def validate(

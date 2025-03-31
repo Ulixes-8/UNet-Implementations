@@ -221,7 +221,7 @@ class UNet(nn.Module):
         dropout_op_kwargs: Dict = None,
         nonlin: Type[nn.Module] = nn.LeakyReLU,
         nonlin_kwargs: Dict = None,
-        deep_supervision: bool = True
+        deep_supervision: bool = False
     ):
         """
         Initialize the UNet model.
@@ -383,9 +383,9 @@ class UNet(nn.Module):
         
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
-            
+                
         Returns:
-            output: Output tensor or list of output tensors if deep supervision is used
+            output: Final output tensor
         """
         # Store skip connections
         skip_connections = []
@@ -399,8 +399,6 @@ class UNet(nn.Module):
         x = self.encoder_stages[-1](x)
         
         # Decoder path
-        outputs = []
-        
         for idx, decoder_stage in enumerate(self.decoder_stages):
             # Use the appropriate skip connection (in reverse order)
             skip_idx = len(skip_connections) - 1 - idx
@@ -408,16 +406,6 @@ class UNet(nn.Module):
             
             # Decoder block
             x = decoder_stage(x, skip)
-            
-            # Save output for deep supervision
-            if self.deep_supervision:
-                output = self.segmentation_outputs[idx](x)
-                outputs.append(output)
         
-        # Final output
-        if self.deep_supervision:
-            # Return outputs in the correct order (largest to smallest)
-            return outputs[::-1]
-        else:
-            # Just return the final output
-            return self.segmentation_outputs[0](x)
+        # Return only the final output (no deep supervision)
+        return self.segmentation_outputs[0](x)

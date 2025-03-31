@@ -177,4 +177,9 @@ cython_debug/
 data/
 *.tar
 notes/
-nnUNet/
+*.png
+*.pth
+*.b2nd
+*.npz
+*.pkl
+nnUNet/nnUNet_preprocessed/Dataset001_PetSegmentation/nnUNetPlans_2d

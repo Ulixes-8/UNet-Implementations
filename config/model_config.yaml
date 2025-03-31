@@ -1,20 +1,15 @@
-# UNet Model Configuration derived from nnU-Net hyperparameters
-
-# Model parameters
-model_name: "unet"
-encoder_name: "resnet34"  # Backbone to use
-encoder_weights: "imagenet"  # Pre-training weights
-in_channels: 3  # RGB images
-classes: 3  # background, cat, dog
-
-# Training parameters
-batch_size: 16  # Adjusted based on nnU-Net
-patch_size: [512, 512]  # Adjusted based on nnU-Net
+batch_size: 16
+classes: 3
+encoder_name: resnet34
+encoder_weights: imagenet
+in_channels: 3
+learning_rate: 0.0001
+loss: combined
+model_name: unet
 num_epochs: 1000
-learning_rate: 0.0001  # Adjusted based on nnU-Net
-optimizer: "Adam"  # SGD or Adam
-loss: "combined"  # dice, ce, or combined
-weight_decay: 0.00003
-
-# Augmentation parameters
+optimizer: Adam
+patch_size:
+- 512
+- 512
 use_augmentation: true
+weight_decay: 3.0e-05

@@ -10,10 +10,35 @@ import torch.nn.functional as F
 from typing import List, Tuple, Dict, Union, Optional, Type
 
 
+class SpatialDropout2d(nn.Module):
+    """
+    Spatial dropout for 2D feature maps that drops entire channels.
+    This performs better than standard dropout for convolutional features.
+    """
+    def __init__(self, drop_prob):
+        super(SpatialDropout2d, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0:
+            return x
+            
+        # Get dimensions
+        _, channels, height, width = x.size()
+        
+        # Sample binary dropout mask
+        mask = x.new_empty(x.size(0), channels, 1, 1).bernoulli_(1 - self.drop_prob)
+        mask = mask.div_(1 - self.drop_prob)
+        
+        # Apply mask
+        x = x * mask.expand_as(x)
+        return x
+
 class ConvBlock(nn.Module):
     """
-    Basic convolutional block for UNet.
-    This block consists of n_convs convolutional layers, each followed by normalization and activation.
+    Basic convolutional block for UNet with spatial dropout.
+    This block consists of n_convs convolutional layers, each followed by normalization, 
+    activation, and optional spatial dropout.
     """
     
     def __init__(
@@ -30,7 +55,8 @@ class ConvBlock(nn.Module):
         dropout_op_kwargs: Dict = None,
         nonlin: Type[nn.Module] = nn.LeakyReLU,
         nonlin_kwargs: Dict = None,
-        conv_bias: bool = True
+        conv_bias: bool = True,
+        spatial_dropout_rate: float = 0.0
     ):
         """
         Initialize the ConvBlock.
@@ -49,6 +75,7 @@ class ConvBlock(nn.Module):
             nonlin: Non-linear activation function to use
             nonlin_kwargs: Arguments for non-linear activation
             conv_bias: Whether to use bias in convolutions
+            spatial_dropout_rate: Rate for spatial dropout (0 to disable)
         """
         super(ConvBlock, self).__init__()
         
@@ -95,7 +122,11 @@ class ConvBlock(nn.Module):
             if nonlin is not None:
                 layers.append(nonlin(**nonlin_kwargs))
             
-            # Add dropout if specified
+            # Add spatial dropout if rate > 0
+            if spatial_dropout_rate > 0:
+                layers.append(SpatialDropout2d(spatial_dropout_rate))
+            
+            # Add regular dropout if specified
             if dropout_op is not None:
                 layers.append(dropout_op(**dropout_op_kwargs))
             
@@ -108,7 +139,6 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         """Forward pass of the convolutional block."""
         return self.block(x)
-
 
 class UpBlock(nn.Module):
     """
@@ -129,7 +159,8 @@ class UpBlock(nn.Module):
         dropout_op_kwargs: Dict = None,
         nonlin: Type[nn.Module] = nn.LeakyReLU,
         nonlin_kwargs: Dict = None,
-        conv_bias: bool = True
+        conv_bias: bool = True,
+        spatial_dropout_rate: float = 0.0
     ):
         """
         Initialize the UpBlock.
@@ -147,6 +178,7 @@ class UpBlock(nn.Module):
             nonlin: Non-linear activation function to use
             nonlin_kwargs: Arguments for non-linear activation
             conv_bias: Whether to use bias in convolutions
+            spatial_dropout_rate: Rate for spatial dropout (0 to disable)
         """
         super(UpBlock, self).__init__()
         
@@ -164,7 +196,8 @@ class UpBlock(nn.Module):
             dropout_op_kwargs=dropout_op_kwargs,
             nonlin=nonlin,
             nonlin_kwargs=nonlin_kwargs,
-            conv_bias=conv_bias
+            conv_bias=conv_bias,
+            spatial_dropout_rate=spatial_dropout_rate
         )
     
     def forward(self, x, skip):
@@ -197,18 +230,16 @@ class UpBlock(nn.Module):
         # Apply convolution block
         return self.conv_block(x)
 
-
 class UNet(nn.Module):
     """
-    UNet model for semantic segmentation, based on nnU-Net architecture.
-    This implementation follows the nnU-Net architecture with configurable hyperparameters.
+    UNet model for semantic segmentation with reduced complexity and spatial dropout.
     """
     
     def __init__(
         self,
         in_channels: int = 3,
         num_classes: int = 3,
-        n_stages: int = 8,
+        n_stages: int = 6,  # Reduced from 8 to 6
         features_per_stage: List[int] = None,
         kernel_sizes: List[Tuple[int, int]] = None,
         strides: List[Tuple[int, int]] = None,
@@ -220,7 +251,9 @@ class UNet(nn.Module):
         dropout_op: Optional[Type[nn.Module]] = None,
         dropout_op_kwargs: Dict = None,
         nonlin: Type[nn.Module] = nn.LeakyReLU,
-        nonlin_kwargs: Dict = None
+        nonlin_kwargs: Dict = None,
+        encoder_dropout_rates: List[float] = None,
+        decoder_dropout_rates: List[float] = None
     ):
         """
         Initialize the UNet model.
@@ -230,7 +263,6 @@ class UNet(nn.Module):
             num_classes: Number of output classes (3 for background, cat, dog)
             n_stages: Number of stages in the encoder
             features_per_stage: Number of features per stage
-            conv_op: Convolution operation to use
             kernel_sizes: Kernel sizes for each stage
             strides: Strides for each stage
             n_conv_per_stage: Number of convolutions per encoder stage
@@ -242,12 +274,14 @@ class UNet(nn.Module):
             dropout_op_kwargs: Arguments for dropout operation
             nonlin: Non-linear activation function to use
             nonlin_kwargs: Arguments for non-linear activation
+            encoder_dropout_rates: Dropout rates for each encoder stage
+            decoder_dropout_rates: Dropout rates for each decoder stage
         """
         super(UNet, self).__init__()
         
         # Set default values for parameters if not provided
         if features_per_stage is None:
-            features_per_stage = [32, 64, 128, 256, 512, 512, 512, 512]
+            features_per_stage = [32, 64, 128, 256, 512, 512]  # Reduced from [32, 64, 128, 256, 512, 512, 512, 512]
         
         if kernel_sizes is None:
             kernel_sizes = [[3, 3]] * n_stages
@@ -266,6 +300,15 @@ class UNet(nn.Module):
         
         if nonlin_kwargs is None:
             nonlin_kwargs = {'inplace': True}
+            
+        # Default dropout rates if not provided
+        if encoder_dropout_rates is None:
+            # Gradually increasing dropout in encoder
+            encoder_dropout_rates = [0.0, 0.0, 0.1, 0.2, 0.3, 0.3]
+            
+        if decoder_dropout_rates is None:
+            # Gradually decreasing dropout in decoder
+            decoder_dropout_rates = [0.3, 0.2, 0.2, 0.1, 0.0]
         
         # Store parameters
         self.in_channels = in_channels
@@ -293,7 +336,8 @@ class UNet(nn.Module):
                     dropout_op_kwargs=dropout_op_kwargs,
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
-                    conv_bias=conv_bias
+                    conv_bias=conv_bias,
+                    spatial_dropout_rate=encoder_dropout_rates[stage]
                 )
             )
             
@@ -321,7 +365,8 @@ class UNet(nn.Module):
                     dropout_op_kwargs=dropout_op_kwargs,
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
-                    conv_bias=conv_bias
+                    conv_bias=conv_bias,
+                    spatial_dropout_rate=decoder_dropout_rates[stage]
                 )
             )
         

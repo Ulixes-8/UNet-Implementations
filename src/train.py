@@ -30,9 +30,9 @@ from models.unet import UNet
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+    """Parse command-line arguments with additional anti-overfitting parameters."""
     parser = argparse.ArgumentParser(
-        description="Train a UNet model for pet segmentation"
+        description="Train a UNet model for pet segmentation with anti-overfitting measures"
     )
     
     parser.add_argument(
@@ -52,28 +52,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=12,  # From nnUNet configuration
+        default=32,  # Increased from 12 to 32
         help="Batch size for training"
     )
     
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1000,  # From nnUNet configuration
-        help="Number of training epochs"
+        default=200,  # Reduced from 1000 to 200
+        help="Maximum number of training epochs (early stopping may reduce this)"
     )
     
     parser.add_argument(
         "--lr",
         type=float,
-        default=0.01,  # From nnUNet configuration
+        default=0.005,  # Reduced from 0.01 to 0.005
         help="Initial learning rate"
     )
     
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=3e-5,  # From nnUNet configuration
+        default=1e-4,  # Increased from 3e-5 to 1e-4 for stronger regularization
         help="Weight decay for optimizer"
     )
     
@@ -94,8 +94,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_every",
         type=int,
-        default=50,  # From nnUNet configuration
+        default=10,  # Save more frequently (changed from 50 to 10)
         help="Save a checkpoint every N epochs"
+    )
+    
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=15,
+        help="Patience for early stopping (number of epochs without improvement)"
+    )
+    
+    parser.add_argument(
+        "--reduced_complexity",
+        action="store_true",
+        default=True,  # Enable by default
+        help="Use reduced complexity model to prevent overfitting"
     )
     
     parser.add_argument(
@@ -120,7 +134,44 @@ def parse_args() -> argparse.Namespace:
     
     return parser.parse_args()
 
+class EarlyStopping:
+    """
+    Early stopping to prevent overfitting.
+    Stops training when a monitored metric has stopped improving.
+    
+    Args:
+        patience: Number of epochs with no improvement after which training will be stopped
+        mode: One of {'min', 'max'}. 'min' -> monitored metric should decrease, 'max' -> increase
+        min_delta: Minimum change in monitored metric to qualify as improvement
+        verbose: Whether to print messages
+    """
+    def __init__(self, patience=10, mode='max', min_delta=0.001, verbose=True):
+        self.patience = patience
+        self.mode = mode
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_score_min = float('inf') if mode == 'min' else -float('inf')
+    
+    def __call__(self, val_score):
+        score = -val_score if self.mode == 'min' else val_score
 
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+            
+        return self.early_stop
+    
 class PetSegmentationDataset(Dataset):
     """Dataset class for the Oxford-IIIT Pet segmentation dataset."""
     
@@ -415,7 +466,7 @@ def validate(
     ignore_label: int = 255  # Ignore border class
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Validate the model on the validation set.
+    Validate the model on the full validation set.
     
     Args:
         model: Model to validate
@@ -438,15 +489,8 @@ def validate(
         "mean_foreground": 0.0
     }
     
-    # For faster validation, just evaluate on a subset
-    max_val_batches = 20  # Limit validation batches for speed
-    
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
-            # Limit validation batches for faster epochs
-            if i >= max_val_batches:
-                break
-                
+        for batch in tqdm(val_loader, desc="Validation", leave=False):
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
             
@@ -483,8 +527,8 @@ def validate(
                 
                 dice_scores[cls_name] += dice.item()
     
-    # Average metrics
-    num_batches = min(max_val_batches, len(val_loader))
+    # Average metrics over all batches
+    num_batches = len(val_loader)
     val_loss /= num_batches
     
     for cls_name in dice_scores:
@@ -647,9 +691,12 @@ def save_checkpoint(
 
 
 def main() -> None:
-    """Main training function."""
+    """Main training function with anti-overfitting measures."""
     # Parse arguments
     args = parse_args()
+    
+    # Override batch size to 32 (from command line)
+    args.batch_size = 32
     
     # Set up output directory
     output_dir = Path(args.output_dir)
@@ -676,8 +723,31 @@ def main() -> None:
         args.num_workers
     )
     
-    # Create model
-    model = create_model(device)
+    # Create reduced complexity model with dropout
+    model = UNet(
+        in_channels=3,  # RGB images
+        num_classes=3,  # background, cat, dog
+        n_stages=6,     # Reduced from 8 to 6
+        features_per_stage=[32, 64, 128, 256, 512, 512],  # Reduced complexity
+        kernel_sizes=[[3, 3]] * 6,
+        strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
+        n_conv_per_stage=[2] * 6,
+        n_conv_per_stage_decoder=[2] * 5,
+        conv_bias=True,
+        norm_op=nn.InstanceNorm2d,
+        norm_op_kwargs={"eps": 1e-5, "affine": True},
+        dropout_op=None,
+        nonlin=nn.LeakyReLU,
+        nonlin_kwargs={"inplace": True},
+        # Add spatial dropout with increasing rates in encoder
+        encoder_dropout_rates=[0.0, 0.0, 0.1, 0.2, 0.3, 0.3],
+        # Add decreasing rates in decoder
+        decoder_dropout_rates=[0.3, 0.2, 0.2, 0.1, 0.0]
+    )
+    
+    # Move model to device
+    model = model.to(device)
+    
     print(f"Created model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     
     # Create optimizer
@@ -718,8 +788,8 @@ def main() -> None:
         else:
             print(f"No checkpoint found at {args.resume}, starting from scratch")
     
-    # Training loop
-    print(f"Starting training for {args.epochs} epochs")
+    # Set up early stopping with patience of 15 epochs
+    early_stopping = EarlyStopping(patience=15, mode='max', verbose=True)
     
     # Create log file
     log_file = output_dir / "training_log.csv"
@@ -727,6 +797,7 @@ def main() -> None:
         f.write("epoch,train_loss,val_loss,dice_background,dice_cat,dice_dog,dice_mean_foreground,learning_rate,epoch_time\n")
     
     # Main training loop
+    print(f"Starting training for up to {args.epochs} epochs with early stopping")
     for epoch in range(start_epoch, args.epochs):
         epoch_start_time = time.time()
         print(f"Epoch {epoch+1}/{args.epochs}")
@@ -741,7 +812,7 @@ def main() -> None:
             scaler
         )
         
-        # Validate
+        # Validate on full validation set
         val_loss, dice_scores = validate(
             model, 
             val_loader, 
@@ -782,8 +853,8 @@ def main() -> None:
             best_dice = dice_scores['mean_foreground']
             print(f"  New best model with mean foreground Dice: {best_dice:.4f}")
         
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0 or is_best:
+        # Save checkpoint more frequently (every 10 epochs)
+        if (epoch + 1) % 10 == 0 or is_best:
             save_checkpoint(
                 model,
                 optimizer,
@@ -793,10 +864,14 @@ def main() -> None:
                 output_dir,
                 is_best
             )
+        
+        # Check for early stopping using mean foreground Dice
+        if early_stopping(dice_scores['mean_foreground']):
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            break
     
     print("Training complete!")
     print(f"Best mean foreground Dice: {best_dice:.4f}")
-
 
 if __name__ == "__main__":
     main()

@@ -1,1 +1,0 @@
-epoch,train_loss,val_loss,dice_background,dice_cat,dice_dog,dice_mean_foreground,learning_rate

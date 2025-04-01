@@ -1,15 +1,16 @@
-batch_size: 16
-classes: 3
-encoder_name: resnet34
-encoder_weights: imagenet
-in_channels: 3
-learning_rate: 0.0001
-loss: combined
-model_name: unet
-num_epochs: 1000
-optimizer: Adam
-patch_size:
-- 512
-- 512
-use_augmentation: true
-weight_decay: 3.0e-05
+{
+    "data_dir": "data/processed",
+    "output_dir": "models/unet_pet_segmentation_reduced",
+    "batch_size": 32,
+    "epochs": 200,
+    "lr": 0.005,
+    "weight_decay": 0.0001,
+    "momentum": 0.99,
+    "num_workers": 4,
+    "save_every": 10,
+    "patience": 15,
+    "reduced_complexity": true,
+    "device": "",
+    "resume": "",
+    "amp": true
+}

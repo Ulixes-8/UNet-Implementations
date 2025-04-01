@@ -182,4 +182,5 @@ notes/
 *.b2nd
 *.npz
 *.pkl
+*.jpg
 nnUNet/nnUNet_preprocessed/Dataset001_PetSegmentation/nnUNetPlans_2d

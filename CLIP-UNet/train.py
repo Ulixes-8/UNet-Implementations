@@ -428,7 +428,51 @@ def create_clip_unet_model(device: torch.device, use_clip: bool = True, clip_mod
     Returns:
         Tuple of (unet_model, clip_extractor)
     """
+    # Default CLIP dimension, will update after loading CLIP model
+    clip_dim = 512
+    
+    # Initialize CLIP model and patch extractor if requested
+    clip_extractor = None
+    if use_clip:
+        print(f"Loading CLIP model: {clip_model_name}")
+        # Load CLIP model
+        try:
+            clip_model, _ = clip.load(clip_model_name, device=device)
+            print(f"CLIP model type: {type(clip_model)}")
+            print(f"CLIP implementation: {clip.__file__}")
+            
+            # Determine CLIP feature dimension
+            if hasattr(clip_model.visual, 'output_dim'):
+                clip_dim = clip_model.visual.output_dim
+            elif hasattr(clip_model.visual, 'transformer') and hasattr(clip_model.visual.transformer, 'width'):
+                clip_dim = clip_model.visual.transformer.width
+            
+            # Print some model structure for debugging
+            print("CLIP model structure:")
+            print(f"Has visual module: {hasattr(clip_model, 'visual')}")
+            if hasattr(clip_model, 'visual'):
+                visual = clip_model.visual
+                print(f"Visual type: {type(visual)}")
+                print(f"Has transformer: {hasattr(visual, 'transformer')}")
+                if hasattr(visual, 'transformer'):
+                    transformer = visual.transformer
+                    print(f"Transformer type: {type(transformer)}")
+                    print(f"Has resblocks: {hasattr(transformer, 'resblocks')}")
+                    if hasattr(transformer, 'resblocks'):
+                        print(f"Number of resblocks: {len(transformer.resblocks)}")
+                        
+            print(f"Using CLIP feature dimension: {clip_dim}")
+            
+            # Create the extractor with the loaded model
+            clip_extractor = ClipPatchExtractor(clip_model, device=device)
+            
+        except Exception as e:
+            print(f"Error loading CLIP model: {e}")
+            print("Continuing without CLIP features...")
+            use_clip = False
+    
     # Create UNet with modified architecture (6 stages instead of 8)
+    # Pass the clip_dim to ensure fusion layer is created correctly
     model = UNet(
         in_channels=3,  # RGB images
         num_classes=3,  # background, cat, dog
@@ -446,21 +490,14 @@ def create_clip_unet_model(device: torch.device, use_clip: bool = True, clip_mod
         nonlin_kwargs={"inplace": True},
         encoder_dropout_rates=[0.0, 0.0, 0.1, 0.2, 0.3, 0.3],
         decoder_dropout_rates=[0.3, 0.2, 0.2, 0.1, 0.0],
-        with_clip_features=use_clip
+        with_clip_features=use_clip,
+        clip_dim=clip_dim
     )
     
     # Move model to device
     model = model.to(device)
     
-    # Initialize CLIP model and patch extractor if requested
-    clip_extractor = None
-    if use_clip:
-        print(f"Loading CLIP model: {clip_model_name}")
-        clip_model, _ = clip.load(clip_model_name, device=device)
-        clip_extractor = ClipPatchExtractor(clip_model, device=device)
-        
     return model, clip_extractor
-
 
 def create_optimizer(model: nn.Module, lr: float, weight_decay: float, momentum: float) -> optim.Optimizer:
     """

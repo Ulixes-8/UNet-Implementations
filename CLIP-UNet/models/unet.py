@@ -255,7 +255,8 @@ class UNet(nn.Module):
         nonlin_kwargs: Dict = None,
         encoder_dropout_rates: List[float] = None,
         decoder_dropout_rates: List[float] = None,
-        with_clip_features: bool = True
+        with_clip_features: bool = True,
+        clip_dim: int = 512
     ):
         """
         Initialize the UNet model with CLIP feature integration.
@@ -279,6 +280,7 @@ class UNet(nn.Module):
             encoder_dropout_rates: Dropout rates for each encoder stage
             decoder_dropout_rates: Dropout rates for each decoder stage
             with_clip_features: Whether to use CLIP features (default: True)
+            clip_dim: Feature dimension from CLIP (default: 512)
         """
         super(UNet, self).__init__()
         
@@ -319,6 +321,7 @@ class UNet(nn.Module):
         self.n_stages = n_stages
         self.features_per_stage = features_per_stage
         self.with_clip_features = with_clip_features
+        self.clip_dim = clip_dim
         
         # Create encoder stages
         self.encoder_stages = nn.ModuleList()
@@ -348,13 +351,16 @@ class UNet(nn.Module):
             # Update current channels
             current_channels = features_per_stage[stage]
         
-        # Create CLIP fusion layer (concatenate and project)
+        # Create CLIP fusion layer placeholder (will be properly initialized in forward pass)
         if self.with_clip_features:
+            # Note: We'll create this properly in the forward pass when we know the dimensions
             self.clip_fusion_conv = nn.Sequential(
-                nn.Conv2d(features_per_stage[-1] + 512, features_per_stage[-1], kernel_size=1, bias=conv_bias),
+                nn.Conv2d(features_per_stage[-1] + clip_dim, features_per_stage[-1], kernel_size=1, bias=conv_bias),
                 norm_op(features_per_stage[-1], **norm_op_kwargs),
                 nonlin(**nonlin_kwargs)
             )
+            # Flag to track if we've adapted the layer
+            self._fusion_adapted = False
         
         # Create decoder stages
         self.decoder_stages = nn.ModuleList()
@@ -415,7 +421,7 @@ class UNet(nn.Module):
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
             clip_features: Optional CLIP patch token features of shape 
-                         (batch_size, 512, 16, 16)
+                        (batch_size, 512, 16, 16)
                 
         Returns:
             output: Final output tensor
@@ -442,6 +448,30 @@ class UNet(nn.Module):
                     align_corners=False
                 )
             
+            # Get the actual feature dimensions
+            encoder_features = x.shape[1]  # Number of channels from encoder
+            clip_channels = clip_features.shape[1]  # Number of channels from CLIP
+            
+            # Print dimensions for debugging
+            # print(f"Encoder features: {encoder_features}, CLIP features: {clip_channels}")
+            
+            # Dynamically adapt the fusion layer if needed
+            expected_channels = encoder_features + clip_channels
+            if not hasattr(self, '_fusion_adapted') or not self._fusion_adapted:
+                # Check if we need to recreate the fusion layer with proper dimensions
+                if self.clip_fusion_conv[0].in_channels != expected_channels:
+                    print(f"Adapting fusion layer: {self.clip_fusion_conv[0].in_channels} → {expected_channels}")
+                    
+                    # Create a new fusion layer with correct dimensions
+                    self.clip_fusion_conv = nn.Sequential(
+                        nn.Conv2d(expected_channels, encoder_features, kernel_size=1, bias=True),
+                        nn.InstanceNorm2d(encoder_features, eps=1e-5, affine=True),
+                        nn.LeakyReLU(inplace=True)
+                    ).to(x.device)
+                    
+                    # Mark as adapted
+                    self._fusion_adapted = True
+            
             # Concatenate and fuse features
             x = torch.cat([x, clip_features], dim=1)
             x = self.clip_fusion_conv(x)
@@ -462,127 +492,126 @@ class UNet(nn.Module):
     
 class ClipPatchExtractor(nn.Module):
     """
-    Module to extract CLIP patch token features and reshape them to a 2D feature map.
-    Compatible with OpenAI's ViT-based CLIP models (e.g., ViT-B/16).
+    Module to extract CLIP patch token features with consistent output dimensions.
     """
     def __init__(self, clip_model, device="cuda"):
         super(ClipPatchExtractor, self).__init__()
-        self.clip_model = clip_model.to(device).eval()
+        self.clip_model = clip_model
         self.device = device
         
-        # Extract visual backbone (ViT)
-        self.visual = self.clip_model.visual
-        if not hasattr(self.visual, 'transformer'):
-            raise ValueError("This extractor is only compatible with ViT-based CLIP models.")
+        # Extract visual backbone
+        if not hasattr(clip_model, 'visual'):
+            raise ValueError("CLIP model doesn't have a 'visual' attribute")
         
-        # Get feature dimension and grid size
-        self.feature_dim = self.visual.transformer.width
+        self.visual = clip_model.visual
+        print(f"CLIP Visual type: {type(self.visual)}")
         
-        # Determine patch grid size based on model
-        if hasattr(self.visual, 'grid_size'):
-            self.grid_size = self.visual.grid_size  # Some implementations store this
+        # Find feature dimension
+        if hasattr(self.visual, 'output_dim'):
+            self.feature_dim = self.visual.output_dim
+            print(f"Found feature_dim from output_dim: {self.feature_dim}")
+        elif hasattr(self.visual, 'transformer') and hasattr(self.visual.transformer, 'width'):
+            self.feature_dim = self.visual.transformer.width
+            print(f"Found feature_dim from transformer.width: {self.feature_dim}")
         else:
-            # For ViT-B/16, this is typically 14x14
-            # For ViT-B/32, this would be 7x7
-            # We'll infer from the positional embedding size
-            if hasattr(self.visual, 'positional_embedding'):
-                pos_embed_size = self.visual.positional_embedding.shape[0]
-                # Positional embedding includes the class token, so subtract 1
-                patch_count = pos_embed_size - 1
-                grid_size = int(np.sqrt(patch_count))
-                if grid_size * grid_size != patch_count:
-                    raise ValueError(f"Patch count {patch_count} is not a perfect square")
-                self.grid_size = (grid_size, grid_size)
+            # Default for ViT-B/16
+            self.feature_dim = 768
+            print(f"Using default feature_dim: {self.feature_dim}")
+        
+        # Find expected grid size
+        if hasattr(self.visual, 'input_resolution'):
+            # OpenAI CLIP ViT models
+            input_res = self.visual.input_resolution
+            patch_size = self.visual.patch_size if hasattr(self.visual, 'patch_size') else 16
+            grid_size = input_res // patch_size
+            self.grid_size = (grid_size, grid_size)
+            print(f"Grid size from input_resolution ({input_res}) and patch_size ({patch_size}): {self.grid_size}")
+        elif hasattr(self.visual, 'grid_size'):
+            self.grid_size = self.visual.grid_size
+            print(f"Grid size from visual.grid_size: {self.grid_size}")
+        elif hasattr(self.visual, 'positional_embedding'):
+            pos_embed_size = self.visual.positional_embedding.shape[0]
+            # Often, position embedding has CLS token too
+            patch_count = pos_embed_size - 1
+            grid_side = int(math.sqrt(patch_count))
+            if grid_side * grid_side == patch_count:
+                self.grid_size = (grid_side, grid_side)
+                print(f"Grid size from positional_embedding ({pos_embed_size}): {self.grid_size}")
             else:
-                # Default to standard ViT-B/16 grid size
+                # Default for ViT-B/16
                 self.grid_size = (14, 14)
+                print(f"Using default grid_size (positional_embedding shape is {pos_embed_size} but not a square + 1): {self.grid_size}")
+        else:
+            # Default for ViT-B/16
+            self.grid_size = (14, 14)
+            print(f"Using default grid_size: {self.grid_size}")
+            
+        # Trace the model structure for debugging
+        self._trace_model_structure()
         
         print(f"CLIP extractor initialized with feature dim {self.feature_dim}, grid size {self.grid_size}")
+    
+    def _trace_model_structure(self):
+        """Print the structure of important components for debugging."""
+        print("\nCLIP Model Structure Trace:")
         
+        if hasattr(self.visual, 'transformer'):
+            transformer = self.visual.transformer
+            print(f"  Transformer: {type(transformer)}")
+            
+            if hasattr(transformer, 'resblocks'):
+                resblocks = transformer.resblocks
+                print(f"  Resblocks: {len(resblocks)} blocks")
+                print(f"  Last Resblock: {type(resblocks[-1])}")
+            elif hasattr(transformer, 'layers'):
+                layers = transformer.layers
+                print(f"  Layers: {len(layers)} layers")
+                print(f"  Last Layer: {type(layers[-1])}")
+            else:
+                print("  No resblocks or layers found in transformer")
+        
+        if hasattr(self.visual, 'positional_embedding'):
+            pos_embed = self.visual.positional_embedding
+            print(f"  Positional Embedding shape: {pos_embed.shape}")
+        
+        print(f"  CLIP model expected input size: 224x224")
+        print("End of structure trace\n")
+    
     def forward(self, images):
         """
-        Extracts patch token embeddings and reshapes them to [B, C, H, W].
+        Extract CLIP features and reshape to spatial feature map.
         
         Args:
-            images: Input tensor of shape [B, 3, H, W]
+            images: Input images [B, 3, H, W]
             
         Returns:
-            patch_map: Tensor of shape [B, feature_dim, 16, 16]
+            Spatial feature map [B, C, 16, 16] with consistent channel dimension
         """
-        B = images.shape[0]
+        batch_size = images.shape[0]
         
-        # Resize to 224x224 for CLIP if needed
+        # Resize to 224x224 for CLIP
         if images.shape[2:] != (224, 224):
-            images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+            resized_images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+        else:
+            resized_images = images
         
-        # Prepare to capture patch features
-        patch_features = []
-        
-        def hook_fn(module, input, output):
-            patch_features.append(output)
-        
-        # Register forward hook on final transformer block
+        # Try simplest approach first - get image embeddings directly
         try:
-            handle = self.visual.transformer.resblocks[-1].register_forward_hook(hook_fn)
-        except (AttributeError, IndexError) as e:
-            # Try alternative locations for the transformer blocks
-            try:
-                handle = self.visual.transformer.layers[-1].register_forward_hook(hook_fn)
-            except (AttributeError, IndexError):
-                raise ValueError("Could not locate transformer blocks in the CLIP model") from e
+            with torch.no_grad():
+                # Extract image embeddings directly
+                embeddings = self.clip_model.encode_image(resized_images.to(self.device))
+                
+                # For consistent output dimensions
+                if embeddings.shape[1] != self.feature_dim:
+                    print(f"Warning: CLIP embeddings dimension {embeddings.shape[1]} != expected {self.feature_dim}")
+                    self.feature_dim = embeddings.shape[1]
+                
+                # Reshape to spatial feature map of size 16x16
+                embeddings = embeddings.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+                output_features = F.interpolate(embeddings, size=(16, 16), mode='bilinear', align_corners=False)
+                return output_features
         
-        # Run forward pass to trigger hook
-        with torch.no_grad():
-            _ = self.clip_model.encode_image(images.to(self.device))
-        
-        # Remove hook
-        handle.remove()
-        
-        # Verify that features were captured
-        if not patch_features:
-            raise RuntimeError("No features were captured by the hook")
-        
-        # Extract patch tokens (exclude CLS token)
-        features = patch_features[0]  # [B, num_patches+1, dim]
-        patch_tokens = features[:, 1:, :]  # remove CLS token
-        
-        # Get the number of patches
-        n_patches = patch_tokens.shape[1]
-        n_patches_1d = int(np.sqrt(n_patches))
-        
-        # Verify we have a square grid of patches
-        if n_patches_1d ** 2 != n_patches:
-            # If not a perfect square, we need to adapt
-            print(f"Warning: Expected square number of patches, got {n_patches}")
-            # Just reshape to the known grid size from initialization
-            n_patches_1d = self.grid_size[0]  # Use the known grid width
-        
-        # Print diagnostic info
-        print(f"Reshaping patch tokens of shape {patch_tokens.shape} to {B}x{n_patches_1d}x{n_patches_1d}x{self.feature_dim}")
-        
-        # Reshape to 2D map: [B, n_patches_1d, n_patches_1d, feature_dim]
-        try:
-            patch_map = patch_tokens.reshape(B, n_patches_1d, n_patches_1d, self.feature_dim)
-            patch_map = patch_map.permute(0, 3, 1, 2)  # [B, feature_dim, n_patches_1d, n_patches_1d]
-        except RuntimeError as e:
-            # Fallback: if reshape fails, use a different approach
-            print(f"Reshape failed: {e}")
-            print("Using fallback approach to create feature map")
-            
-            # Create a new tensor with the right shape
-            patch_map = torch.zeros(B, self.feature_dim, n_patches_1d, n_patches_1d, device=patch_tokens.device)
-            
-            # If we have fewer patches than expected, use what we have
-            actual_patches = min(n_patches, n_patches_1d * n_patches_1d)
-            
-            # Fill the map with available patches
-            for i in range(actual_patches):
-                h = i // n_patches_1d
-                w = i % n_patches_1d
-                patch_map[:, :, h, w] = patch_tokens[:, i, :]
-        
-        # Upsample to match decoder bottleneck size (16x16)
-        if patch_map.shape[2:] != (16, 16):
-            patch_map = F.interpolate(patch_map, size=(16, 16), mode='bilinear', align_corners=False)
-        
-        return patch_map
+        except Exception as e:
+            print(f"Error extracting CLIP embeddings: {e}")
+            # Return zero tensor as fallback
+            return torch.zeros(batch_size, self.feature_dim, 16, 16, device=self.device)

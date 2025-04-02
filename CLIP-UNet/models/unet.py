@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Union, Optional, Type
 import numpy as np
+import math
 
 class SpatialDropout2d(nn.Module):
     """

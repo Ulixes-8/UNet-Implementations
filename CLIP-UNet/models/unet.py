@@ -1,14 +1,14 @@
 """
-UNet implementation for pet segmentation
+UNet implementation for pet segmentation with CLIP patch token integration
 This module implements a UNet model that follows the architecture and hyperparameters
-defined by nnU-Net for the pet segmentation task.
+defined by nnU-Net for the pet segmentation task, enhanced with CLIP patch token features.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Union, Optional, Type
-
+import numpy as np
 
 class SpatialDropout2d(nn.Module):
     """
@@ -232,7 +232,8 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     """
-    UNet model for semantic segmentation with reduced complexity and spatial dropout.
+    UNet model for semantic segmentation with reduced complexity, spatial dropout,
+    and integration of CLIP patch token features.
     """
     
     def __init__(
@@ -253,10 +254,11 @@ class UNet(nn.Module):
         nonlin: Type[nn.Module] = nn.LeakyReLU,
         nonlin_kwargs: Dict = None,
         encoder_dropout_rates: List[float] = None,
-        decoder_dropout_rates: List[float] = None
+        decoder_dropout_rates: List[float] = None,
+        with_clip_features: bool = True
     ):
         """
-        Initialize the UNet model.
+        Initialize the UNet model with CLIP feature integration.
         
         Args:
             in_channels: Number of input channels (3 for RGB images)
@@ -276,6 +278,7 @@ class UNet(nn.Module):
             nonlin_kwargs: Arguments for non-linear activation
             encoder_dropout_rates: Dropout rates for each encoder stage
             decoder_dropout_rates: Dropout rates for each decoder stage
+            with_clip_features: Whether to use CLIP features (default: True)
         """
         super(UNet, self).__init__()
         
@@ -315,6 +318,7 @@ class UNet(nn.Module):
         self.num_classes = num_classes
         self.n_stages = n_stages
         self.features_per_stage = features_per_stage
+        self.with_clip_features = with_clip_features
         
         # Create encoder stages
         self.encoder_stages = nn.ModuleList()
@@ -343,6 +347,14 @@ class UNet(nn.Module):
             
             # Update current channels
             current_channels = features_per_stage[stage]
+        
+        # Create CLIP fusion layer (concatenate and project)
+        if self.with_clip_features:
+            self.clip_fusion_conv = nn.Sequential(
+                nn.Conv2d(features_per_stage[-1] + 512, features_per_stage[-1], kernel_size=1, bias=conv_bias),
+                norm_op(features_per_stage[-1], **norm_op_kwargs),
+                nonlin(**nonlin_kwargs)
+            )
         
         # Create decoder stages
         self.decoder_stages = nn.ModuleList()
@@ -396,12 +408,14 @@ class UNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
-    def forward(self, x):
+    def forward(self, x, clip_features=None):
         """
-        Forward pass of the UNet model.
+        Forward pass of the UNet model with optional CLIP feature integration.
         
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
+            clip_features: Optional CLIP patch token features of shape 
+                         (batch_size, 512, 16, 16)
                 
         Returns:
             output: Final output tensor
@@ -417,6 +431,21 @@ class UNet(nn.Module):
         # Bottom stage (without skip connection)
         x = self.encoder_stages[-1](x)
         
+        # Fuse CLIP features at bottleneck if provided
+        if self.with_clip_features and clip_features is not None:
+            # Verify feature map sizes match
+            if x.shape[2:] != clip_features.shape[2:]:
+                clip_features = F.interpolate(
+                    clip_features,
+                    size=x.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            # Concatenate and fuse features
+            x = torch.cat([x, clip_features], dim=1)
+            x = self.clip_fusion_conv(x)
+        
         # Decoder path
         for idx, decoder_stage in enumerate(self.decoder_stages):
             # Use the appropriate skip connection (in reverse order)
@@ -430,3 +459,130 @@ class UNet(nn.Module):
         output = self.segmentation_output(x)
         
         return output
+    
+class ClipPatchExtractor(nn.Module):
+    """
+    Module to extract CLIP patch token features and reshape them to a 2D feature map.
+    Compatible with OpenAI's ViT-based CLIP models (e.g., ViT-B/16).
+    """
+    def __init__(self, clip_model, device="cuda"):
+        super(ClipPatchExtractor, self).__init__()
+        self.clip_model = clip_model.to(device).eval()
+        self.device = device
+        
+        # Extract visual backbone (ViT)
+        self.visual = self.clip_model.visual
+        if not hasattr(self.visual, 'transformer'):
+            raise ValueError("This extractor is only compatible with ViT-based CLIP models.")
+        
+        # Get feature dimension and grid size
+        self.feature_dim = self.visual.transformer.width
+        
+        # Determine patch grid size based on model
+        if hasattr(self.visual, 'grid_size'):
+            self.grid_size = self.visual.grid_size  # Some implementations store this
+        else:
+            # For ViT-B/16, this is typically 14x14
+            # For ViT-B/32, this would be 7x7
+            # We'll infer from the positional embedding size
+            if hasattr(self.visual, 'positional_embedding'):
+                pos_embed_size = self.visual.positional_embedding.shape[0]
+                # Positional embedding includes the class token, so subtract 1
+                patch_count = pos_embed_size - 1
+                grid_size = int(np.sqrt(patch_count))
+                if grid_size * grid_size != patch_count:
+                    raise ValueError(f"Patch count {patch_count} is not a perfect square")
+                self.grid_size = (grid_size, grid_size)
+            else:
+                # Default to standard ViT-B/16 grid size
+                self.grid_size = (14, 14)
+        
+        print(f"CLIP extractor initialized with feature dim {self.feature_dim}, grid size {self.grid_size}")
+        
+    def forward(self, images):
+        """
+        Extracts patch token embeddings and reshapes them to [B, C, H, W].
+        
+        Args:
+            images: Input tensor of shape [B, 3, H, W]
+            
+        Returns:
+            patch_map: Tensor of shape [B, feature_dim, 16, 16]
+        """
+        B = images.shape[0]
+        
+        # Resize to 224x224 for CLIP if needed
+        if images.shape[2:] != (224, 224):
+            images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+        
+        # Prepare to capture patch features
+        patch_features = []
+        
+        def hook_fn(module, input, output):
+            patch_features.append(output)
+        
+        # Register forward hook on final transformer block
+        try:
+            handle = self.visual.transformer.resblocks[-1].register_forward_hook(hook_fn)
+        except (AttributeError, IndexError) as e:
+            # Try alternative locations for the transformer blocks
+            try:
+                handle = self.visual.transformer.layers[-1].register_forward_hook(hook_fn)
+            except (AttributeError, IndexError):
+                raise ValueError("Could not locate transformer blocks in the CLIP model") from e
+        
+        # Run forward pass to trigger hook
+        with torch.no_grad():
+            _ = self.clip_model.encode_image(images.to(self.device))
+        
+        # Remove hook
+        handle.remove()
+        
+        # Verify that features were captured
+        if not patch_features:
+            raise RuntimeError("No features were captured by the hook")
+        
+        # Extract patch tokens (exclude CLS token)
+        features = patch_features[0]  # [B, num_patches+1, dim]
+        patch_tokens = features[:, 1:, :]  # remove CLS token
+        
+        # Get the number of patches
+        n_patches = patch_tokens.shape[1]
+        n_patches_1d = int(np.sqrt(n_patches))
+        
+        # Verify we have a square grid of patches
+        if n_patches_1d ** 2 != n_patches:
+            # If not a perfect square, we need to adapt
+            print(f"Warning: Expected square number of patches, got {n_patches}")
+            # Just reshape to the known grid size from initialization
+            n_patches_1d = self.grid_size[0]  # Use the known grid width
+        
+        # Print diagnostic info
+        print(f"Reshaping patch tokens of shape {patch_tokens.shape} to {B}x{n_patches_1d}x{n_patches_1d}x{self.feature_dim}")
+        
+        # Reshape to 2D map: [B, n_patches_1d, n_patches_1d, feature_dim]
+        try:
+            patch_map = patch_tokens.reshape(B, n_patches_1d, n_patches_1d, self.feature_dim)
+            patch_map = patch_map.permute(0, 3, 1, 2)  # [B, feature_dim, n_patches_1d, n_patches_1d]
+        except RuntimeError as e:
+            # Fallback: if reshape fails, use a different approach
+            print(f"Reshape failed: {e}")
+            print("Using fallback approach to create feature map")
+            
+            # Create a new tensor with the right shape
+            patch_map = torch.zeros(B, self.feature_dim, n_patches_1d, n_patches_1d, device=patch_tokens.device)
+            
+            # If we have fewer patches than expected, use what we have
+            actual_patches = min(n_patches, n_patches_1d * n_patches_1d)
+            
+            # Fill the map with available patches
+            for i in range(actual_patches):
+                h = i // n_patches_1d
+                w = i % n_patches_1d
+                patch_map[:, :, h, w] = patch_tokens[:, i, :]
+        
+        # Upsample to match decoder bottleneck size (16x16)
+        if patch_map.shape[2:] != (16, 16):
+            patch_map = F.interpolate(patch_map, size=(16, 16), mode='bilinear', align_corners=False)
+        
+        return patch_map

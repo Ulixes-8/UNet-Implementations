@@ -2,17 +2,18 @@
 """
 Script: train.py
 
-This script trains a UNet model for pet segmentation using the Oxford-IIIT Pet Dataset.
-It handles the training loop, validation, checkpointing, and logging.
+This script trains a UNet model for pet segmentation using the Oxford-IIIT Pet Dataset,
+enhanced with CLIP patch token features for improved semantic segmentation.
 
 Example Usage:
-    python src/train.py --data_dir data/processed --output_dir models/unet_pet_segmentation
+    python train.py --data_dir /home/ulixes/segmentation_cv/unet/data/processed --output_dir models/clip_unet_pet_segmentation
 """
 
 import argparse
 import json
 import os
 import time
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -23,65 +24,66 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import cv2
 from tqdm import tqdm
+import clip
 
 # Import local modules
 from models.losses import SimpleLoss
-from models.unet import UNet
+from models.unet import UNet, ClipPatchExtractor
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments with additional loss function parameters."""
+    """Parse command-line arguments with additional CLIP-related parameters."""
     parser = argparse.ArgumentParser(
-        description="Train a UNet model for pet segmentation with anti-overfitting measures"
+        description="Train a UNet model enhanced with CLIP features for pet segmentation"
     )
     
     # Original arguments
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/processed",
+        default="/home/ulixes/segmentation_cv/unet/data/processed",
         help="Path to the processed data directory"
     )
     
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="models/unet_pet_segmentation",
+        default="models/clip_unet_pet_segmentation",
         help="Path to store model checkpoints and logs"
     )
     
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,  # Increased from 12 to 32
+        default=32, 
         help="Batch size for training"
     )
     
     parser.add_argument(
         "--epochs",
         type=int,
-        default=200,  # Reduced from 1000 to 200
+        default=200,
         help="Maximum number of training epochs (early stopping may reduce this)"
     )
     
     parser.add_argument(
         "--lr",
         type=float,
-        default=0.005,  # Reduced from 0.01 to 0.005
+        default=0.005,
         help="Initial learning rate"
     )
     
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=1e-4,  # Increased from 3e-5 to 1e-4 for stronger regularization
+        default=1e-4,
         help="Weight decay for optimizer"
     )
     
     parser.add_argument(
         "--momentum",
         type=float,
-        default=0.99,  # From nnUNet configuration
+        default=0.99,
         help="Momentum for SGD optimizer"
     )
     
@@ -95,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_every",
         type=int,
-        default=10,  # Save more frequently (changed from 50 to 10)
+        default=10,
         help="Save a checkpoint every N epochs"
     )
     
@@ -104,13 +106,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Patience for early stopping (number of epochs without improvement)"
-    )
-    
-    parser.add_argument(
-        "--reduced_complexity",
-        action="store_true",
-        default=True,  # Enable by default
-        help="Use reduced complexity model to prevent overfitting"
     )
     
     parser.add_argument(
@@ -133,32 +128,20 @@ def parse_args() -> argparse.Namespace:
         help="Use automatic mixed precision training"
     )
     
-    # New arguments for loss function
+    # New arguments for CLIP integration
     parser.add_argument(
-        "--weighted_ce",
+        "--use_clip",
         action="store_true",
-        default=True,  # Enable by default
-        help="Use class weighting in cross entropy loss based on inverse frequency"
+        default=True,  # Enable CLIP by default
+        help="Use CLIP patch token features to enhance UNet"
     )
     
     parser.add_argument(
-        "--static_weights",
-        action="store_true",
-        help="Compute class weights once at the beginning instead of dynamically per batch"
-    )
-    
-    parser.add_argument(
-        "--dice_weight",
-        type=float,
-        default=1.0,
-        help="Weight for the Dice loss component"
-    )
-    
-    parser.add_argument(
-        "--ce_weight",
-        type=float,
-        default=1.0,
-        help="Weight for the Cross Entropy loss component"
+        "--clip_model",
+        type=str,
+        default="ViT-B/16",
+        choices=["ViT-B/16", "ViT-B/32", "ViT-L/14"],
+        help="CLIP model variant to use"
     )
     
     return parser.parse_args()
@@ -208,6 +191,7 @@ class PetSegmentationDataset(Dataset):
         self,
         images_dir: str,
         masks_dir: str,
+        clip_images_dir: str = None,
         include_augmented: bool = True,
         target_size: Tuple[int, int] = (512, 512)
     ):
@@ -215,13 +199,15 @@ class PetSegmentationDataset(Dataset):
         Initialize the dataset.
         
         Args:
-            images_dir: Directory containing images
+            images_dir: Directory containing images (512x512)
             masks_dir: Directory containing mask annotations
+            clip_images_dir: Directory containing pre-resized images for CLIP (224x224)
             include_augmented: Whether to include augmented images (if available)
             target_size: Target size for images and masks (height, width)
         """
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
+        self.clip_images_dir = Path(clip_images_dir) if clip_images_dir else None
         self.target_size = target_size
         
         # Get all image files from the directory
@@ -268,6 +254,12 @@ class PetSegmentationDataset(Dataset):
         else:
             mask_path = self.masks_dir / f"{img_path.stem}.png"
         
+        # Get corresponding CLIP image path
+        if self.clip_images_dir:
+            clip_img_path = self.clip_images_dir / f"{img_path.stem}.jpg"
+        else:
+            clip_img_path = None
+        
         # Load image and mask
         try:
             image = cv2.imread(str(img_path))
@@ -278,6 +270,16 @@ class PetSegmentationDataset(Dataset):
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 raise ValueError(f"Failed to load mask: {mask_path}")
+            
+            # Load pre-resized CLIP image if available
+            if clip_img_path and clip_img_path.exists():
+                clip_image = cv2.imread(str(clip_img_path))
+                if clip_image is None:
+                    raise ValueError(f"Failed to load CLIP image: {clip_img_path}")
+                clip_image = cv2.cvtColor(clip_image, cv2.COLOR_BGR2RGB)
+            else:
+                # Fallback to resizing the original image
+                clip_image = cv2.resize(image, (224, 224), interpolation=cv2.INTER_LINEAR)
                 
             # Store original dimensions before resizing
             original_dims = mask.shape[:2]  # (height, width)
@@ -286,6 +288,7 @@ class PetSegmentationDataset(Dataset):
             # Return a blank sample as fallback
             image = np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.uint8)
             mask = np.zeros(self.target_size, dtype=np.uint8)
+            clip_image = np.zeros((224, 224, 3), dtype=np.uint8)
             original_dims = self.target_size
         
         # Ensure image and mask have the correct dimensions
@@ -301,11 +304,13 @@ class PetSegmentationDataset(Dataset):
         
         # Convert image to tensor and normalize (0-1)
         image = torch.from_numpy(image).float().permute(2, 0, 1) / 255.0
+        clip_image = torch.from_numpy(clip_image).float().permute(2, 0, 1) / 255.0
         
         # Apply standardization (approximately equivalent to ImageNet normalization)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         image = (image - mean) / std
+        clip_image = (clip_image - mean) / std
         
         # Convert mask to tensor
         mask = torch.from_numpy(mask).long()
@@ -315,8 +320,10 @@ class PetSegmentationDataset(Dataset):
         
         return {
             "image": image, 
+            "clip_image": clip_image,
             "mask": mask,
-            "original_dims": original_dims
+            "original_dims": original_dims,
+            "filename": img_path.name
         }
 
 
@@ -339,10 +346,23 @@ def create_dataloaders(
     # Set directories for training data
     train_imgs_dir = Path(data_dir) / "Train" / "resized"
     train_masks_dir = Path(data_dir) / "Train" / "resized_label"
+    train_clip_imgs_dir = Path(data_dir) / "Train" / "resized_clip"
     
     # Set directories for validation data
     val_imgs_dir = Path(data_dir) / "Val" / "resized"
     val_masks_dir = Path(data_dir) / "Val" / "processed_labels"
+    val_clip_imgs_dir = Path(data_dir) / "Val" / "resized_clip"
+    
+    # Verify directories exist
+    if not train_clip_imgs_dir.exists():
+        print(f"Warning: CLIP images directory not found: {train_clip_imgs_dir}")
+        print("Falling back to on-the-fly resizing for CLIP input")
+        train_clip_imgs_dir = None
+        
+    if not val_clip_imgs_dir.exists():
+        print(f"Warning: CLIP images directory not found for validation: {val_clip_imgs_dir}")
+        print("Falling back to on-the-fly resizing for CLIP input")
+        val_clip_imgs_dir = None
     
     # Target size for all images and masks
     target_size = (512, 512)
@@ -351,6 +371,7 @@ def create_dataloaders(
     train_dataset = PetSegmentationDataset(
         images_dir=train_imgs_dir,
         masks_dir=train_masks_dir,
+        clip_images_dir=train_clip_imgs_dir,
         include_augmented=True,
         target_size=target_size
     )
@@ -358,6 +379,7 @@ def create_dataloaders(
     val_dataset = PetSegmentationDataset(
         images_dir=val_imgs_dir,
         masks_dir=val_masks_dir,
+        clip_images_dir=val_clip_imgs_dir,
         include_augmented=False,
         target_size=target_size
     )
@@ -394,38 +416,50 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
-def create_model(device: torch.device) -> nn.Module:
+def create_clip_unet_model(device: torch.device, use_clip: bool = True, clip_model_name: str = "ViT-B/16") -> Tuple[nn.Module, Optional[nn.Module]]:
     """
-    Create the UNet model based on nnUNet hyperparameters.
+    Create the UNet model with CLIP integration.
     
     Args:
         device: Device to use for the model
+        use_clip: Whether to use CLIP features
+        clip_model_name: Name of the CLIP model variant to use
         
     Returns:
-        Initialized model
+        Tuple of (unet_model, clip_extractor)
     """
-    # Create UNet with nnUNet hyperparameters
+    # Create UNet with modified architecture (6 stages instead of 8)
     model = UNet(
         in_channels=3,  # RGB images
         num_classes=3,  # background, cat, dog
-        n_stages=8,
-        features_per_stage=[32, 64, 128, 256, 512, 512, 512, 512],
-        kernel_sizes=[[3, 3]] * 8,
-        strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
-        n_conv_per_stage=[2] * 8,
-        n_conv_per_stage_decoder=[2] * 7,
+        n_stages=6,     # Reduced complexity
+        features_per_stage=[32, 64, 128, 256, 512, 512],
+        kernel_sizes=[[3, 3]] * 6,
+        strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
+        n_conv_per_stage=[2] * 6,
+        n_conv_per_stage_decoder=[2] * 5,
         conv_bias=True,
         norm_op=nn.InstanceNorm2d,
         norm_op_kwargs={"eps": 1e-5, "affine": True},
         dropout_op=None,
         nonlin=nn.LeakyReLU,
-        nonlin_kwargs={"inplace": True}
+        nonlin_kwargs={"inplace": True},
+        encoder_dropout_rates=[0.0, 0.0, 0.1, 0.2, 0.3, 0.3],
+        decoder_dropout_rates=[0.3, 0.2, 0.2, 0.1, 0.0],
+        with_clip_features=use_clip
     )
     
     # Move model to device
     model = model.to(device)
     
-    return model
+    # Initialize CLIP model and patch extractor if requested
+    clip_extractor = None
+    if use_clip:
+        print(f"Loading CLIP model: {clip_model_name}")
+        clip_model, _ = clip.load(clip_model_name, device=device)
+        clip_extractor = ClipPatchExtractor(clip_model, device=device)
+        
+    return model, clip_extractor
 
 
 def create_optimizer(model: nn.Module, lr: float, weight_decay: float, momentum: float) -> optim.Optimizer:
@@ -512,6 +546,7 @@ def validate(
     val_loader: DataLoader,
     loss_function: nn.Module,
     device: torch.device,
+    clip_extractor: Optional[nn.Module] = None,
     ignore_label: int = 255  # Ignore border class
 ) -> Tuple[float, Dict[str, float]]:
     """
@@ -522,6 +557,7 @@ def validate(
         val_loader: Validation data loader
         loss_function: Loss function
         device: Device to use
+        clip_extractor: Optional CLIP feature extractor
         ignore_label: Label to ignore in metrics (border class)
         
     Returns:
@@ -543,8 +579,14 @@ def validate(
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
             
-            # Forward pass
-            outputs = model(images)
+            # Extract CLIP features if available
+            clip_features = None
+            if clip_extractor is not None:
+                clip_images = batch["clip_image"].to(device)
+                clip_features = clip_extractor(clip_images)
+            
+            # Forward pass with CLIP features
+            outputs = model(images, clip_features)
             
             # Compute loss on model outputs (before any resizing)
             loss = loss_function(outputs, masks)
@@ -595,6 +637,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     loss_function: nn.Module,
     device: torch.device,
+    clip_extractor: Optional[nn.Module] = None,
     scaler: Optional[torch.cuda.amp.GradScaler] = None
 ) -> float:
     """
@@ -606,6 +649,7 @@ def train_one_epoch(
         optimizer: Optimizer
         loss_function: Loss function
         device: Device to use
+        clip_extractor: Optional CLIP feature extractor
         scaler: Optional grad scaler for mixed precision training
         
     Returns:
@@ -630,6 +674,13 @@ def train_one_epoch(
         images = batch["image"].to(device)
         masks = batch["mask"].to(device)
         
+        # Extract CLIP features if available
+        clip_features = None
+        if clip_extractor is not None:
+            clip_images = batch["clip_image"].to(device)
+            with torch.no_grad():  # No gradients needed for CLIP
+                clip_features = clip_extractor(clip_images)
+        
         # Zero gradients
         optimizer.zero_grad()
         
@@ -637,7 +688,7 @@ def train_one_epoch(
         forward_start = time.time()
         if scaler is not None:
             with torch.cuda.amp.autocast():
-                outputs = model(images)
+                outputs = model(images, clip_features)
                 
                 # Time loss calculation
                 loss_start = time.time()
@@ -651,7 +702,7 @@ def train_one_epoch(
             scaler.update()
             backward_time += time.time() - backward_start
         else:
-            outputs = model(images)
+            outputs = model(images, clip_features)
             
             # Time loss calculation
             loss_start = time.time()
@@ -687,6 +738,8 @@ def save_checkpoint(
     epoch: int,
     best_dice: float,
     output_dir: Path,
+    clip_extractor: Optional[nn.Module] = None,
+    args: Optional[argparse.Namespace] = None,
     is_best: bool = False
 ) -> None:
     """
@@ -699,6 +752,8 @@ def save_checkpoint(
         epoch: Current epoch number
         best_dice: Best validation Dice score so far
         output_dir: Directory to save to
+        clip_extractor: Optional CLIP feature extractor
+        args: Command-line arguments
         is_best: Whether this is the best model so far
     """
     # Create the checkpoint directory
@@ -715,15 +770,17 @@ def save_checkpoint(
         "config": {
             "in_channels": 3,
             "num_classes": 3,
-            "n_stages": 8,
-            "features_per_stage": [32, 64, 128, 256, 512, 512, 512, 512],
-            "kernel_sizes": [[3, 3]] * 8,
-            "strides": [[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
-            "n_conv_per_stage": [2] * 8,
-            "n_conv_per_stage_decoder": [2] * 7,
+            "n_stages": 6,
+            "features_per_stage": [32, 64, 128, 256, 512, 512],
+            "kernel_sizes": [[3, 3]] * 6,
+            "strides": [[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
+            "n_conv_per_stage": [2] * 6,
+            "n_conv_per_stage_decoder": [2] * 5,
             "conv_bias": True,
             "norm_op_kwargs": {"eps": 1e-5, "affine": True},
-            "nonlin_kwargs": {"inplace": True}
+            "nonlin_kwargs": {"inplace": True},
+            "with_clip_features": clip_extractor is not None,
+            "clip_model": args.clip_model if clip_extractor is not None else None
         }
     }
     
@@ -740,12 +797,12 @@ def save_checkpoint(
 
 
 def main() -> None:
-    """Main training function with anti-overfitting measures and weighted loss."""
+    """Main training function with CLIP integration and anti-overfitting measures."""
     # Parse arguments
     args = parse_args()
     
-    # Override batch size to 32 (from command line)
-    args.batch_size = 32
+    # Set batch size to 16 to accommodate CLIP processing
+    args.batch_size = 16
     
     # Set up output directory
     output_dir = Path(args.output_dir)
@@ -765,37 +822,25 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"Using mixed precision: {args.amp}")
     
-    # Create dataloaders
+    # Create dataloaders with pre-resized CLIP images
     train_loader, val_loader = create_dataloaders(
         args.data_dir, 
         args.batch_size, 
         args.num_workers
     )
     
-    # Create reduced complexity model with dropout
-    model = UNet(
-        in_channels=3,  # RGB images
-        num_classes=3,  # background, cat, dog
-        n_stages=6,     # Reduced from 8 to 6
-        features_per_stage=[32, 64, 128, 256, 512, 512],  # Reduced complexity
-        kernel_sizes=[[3, 3]] * 6,
-        strides=[[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]],
-        n_conv_per_stage=[2] * 6,
-        n_conv_per_stage_decoder=[2] * 5,
-        conv_bias=True,
-        norm_op=nn.InstanceNorm2d,
-        norm_op_kwargs={"eps": 1e-5, "affine": True},
-        dropout_op=None,
-        nonlin=nn.LeakyReLU,
-        nonlin_kwargs={"inplace": True},
-        # Add spatial dropout with increasing rates in encoder
-        encoder_dropout_rates=[0.0, 0.0, 0.1, 0.2, 0.3, 0.3],
-        # Add decreasing rates in decoder
-        decoder_dropout_rates=[0.3, 0.2, 0.2, 0.1, 0.0]
+    # Create CLIP-enhanced UNet model
+    model, clip_extractor = create_clip_unet_model(
+        device=device,
+        use_clip=args.use_clip,
+        clip_model_name=args.clip_model
     )
     
-    # Move model to device
-    model = model.to(device)
+    # Log CLIP usage status
+    if args.use_clip and clip_extractor is not None:
+        print(f"Using CLIP {args.clip_model} for enhanced feature extraction")
+    else:
+        print("Running without CLIP feature enhancement")
     
     print(f"Created model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     
@@ -811,78 +856,15 @@ def main() -> None:
     scheduler = create_lr_scheduler(optimizer, args.epochs)
     
     # Create loss function with class weighting
-    if args.weighted_ce:
-        print("Using weighted cross entropy loss based on inverse class frequency")
-        
-        if args.static_weights:
-            print("Using static class weights computed once at start")
-            # If static weights are requested, we need to compute them now
-            # by scanning through the dataset
-            
-            # First, let's compute class frequencies across the training set
-            class_pixels = torch.zeros(3, device=device)  # 3 classes: background, cat, dog
-            total_valid_pixels = 0
-            
-            print("Computing class frequencies across training set...")
-            with torch.no_grad():
-                for batch in tqdm(train_loader, desc="Computing class weights"):
-                    masks = batch["mask"].to(device)
-                    # Create a mask for valid pixels (not ignore_index/border class)
-                    valid_mask = (masks != 255)
-                    valid_masks = masks * valid_mask.long()
-                    
-                    # Count pixels for each class
-                    for c in range(3):
-                        class_pixels[c] += torch.sum((valid_masks == c) & valid_mask).float()
-                    
-                    total_valid_pixels += torch.sum(valid_mask).float()
-            
-            # Compute weights: total / class_count
-            # Avoid division by zero
-            class_pixels = torch.clamp(class_pixels, min=1.0)
-            static_weights = total_valid_pixels / class_pixels
-            
-            # Normalize weights to sum to num_classes
-            static_weights = static_weights * (3 / static_weights.sum())
-            
-            print(f"Computed class weights: {static_weights.cpu().numpy()}")
-            
-            # Create loss with static weights
-            loss_function = SimpleLoss(
-                weight_dice=args.dice_weight,
-                weight_ce=args.ce_weight,
-                ignore_index=255,
-                smooth=1e-5,
-                class_weights=static_weights,
-                dynamic_weights=False
-            )
-        else:
-            print("Using dynamic class weights computed per batch")
-            # Use dynamic weights computed during forward pass
-            loss_function = SimpleLoss(
-                weight_dice=args.dice_weight,
-                weight_ce=args.ce_weight,
-                ignore_index=255,
-                smooth=1e-5,
-                class_weights=None,
-                dynamic_weights=True
-            )
-    else:
-        print("Using unweighted loss function")
-        # Use unweighted loss
-        loss_function = SimpleLoss(
-            weight_dice=args.dice_weight,
-            weight_ce=args.ce_weight,
-            ignore_index=255,
-            smooth=1e-5
-        )
+    loss_function = get_loss_function(use_weighted_ce=True, dynamic_weights=True)
+    print("Using weighted cross entropy loss based on inverse class frequency with dynamic weights")
     
     # Initialize training state
     start_epoch = 0
     best_dice = 0.0
     
     # Set up mixed precision training if requested
-    scaler = torch.amp.GradScaler(device_type='cuda') if args.amp and torch.cuda.is_available() else None
+    scaler = torch.cuda.amp.GradScaler() if args.amp and torch.cuda.is_available() else None
     
     # Resume from checkpoint if provided
     if args.resume:
@@ -915,22 +897,24 @@ def main() -> None:
         epoch_start_time = time.time()
         print(f"Epoch {epoch+1}/{args.epochs}")
         
-        # Train for one epoch
+        # Train for one epoch with CLIP features
         train_loss = train_one_epoch(
             model, 
             train_loader, 
             optimizer, 
             loss_function, 
-            device, 
+            device,
+            clip_extractor,
             scaler
         )
         
-        # Validate on full validation set
+        # Validate on full validation set with CLIP features
         val_loss, dice_scores = validate(
             model, 
             val_loader, 
             loss_function, 
-            device
+            device,
+            clip_extractor
         )
         
         # Get current learning rate
@@ -966,8 +950,8 @@ def main() -> None:
             best_dice = dice_scores['mean_foreground']
             print(f"  New best model with mean foreground Dice: {best_dice:.4f}")
         
-        # Save checkpoint more frequently (every 10 epochs)
-        if (epoch + 1) % 10 == 0 or is_best:
+        # Save checkpoint
+        if (epoch + 1) % args.save_every == 0 or is_best:
             save_checkpoint(
                 model,
                 optimizer,
@@ -975,6 +959,8 @@ def main() -> None:
                 epoch + 1,
                 best_dice,
                 output_dir,
+                clip_extractor,
+                args,
                 is_best
             )
         

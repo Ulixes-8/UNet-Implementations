@@ -454,3 +454,13 @@ class Autoencoder(nn.Module):
             Tuple[nn.ModuleList, nn.Sequential]: Decoder stages and reconstruction output layer
         """
         return self.decoder_stages, self.reconstruction_output
+    
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        for stage_idx, stage in enumerate(self.encoder_stages[:-1]):
+            x = stage(x)
+        x = self.encoder_stages[-1](x)
+        
+        # x is shape [N, C, H, W]
+        # Option A: flatten everything to shape [N, C*H*W]
+        x = x.view(x.size(0), -1)
+        return x

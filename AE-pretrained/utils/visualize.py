@@ -171,122 +171,64 @@ def save_comparison_grid(
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import numpy as np
 
 def visualize_latent_space(
-    model: torch.nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    output_path: str,
-    device: torch.device,
-    n_samples: int = 1000,
-    method: str = 'pca'
-) -> None:
+    latents: np.ndarray,
+    labels: np.ndarray,
+    save_path: str,
+    method: str = 'pca',
+    perplexity: float = 30.0
+):
     """
-    Visualize the latent space of the autoencoder using dimensionality reduction.
+    Visualize latent space (2D) for an array of embeddings (N, latent_dim).
     
     Args:
-        model: Trained autoencoder model
-        dataloader: Data loader for samples
-        output_path: Path to save the visualization
-        device: Device to run inference on
-        n_samples: Maximum number of samples to visualize
-        method: Dimensionality reduction method ('pca' or 'tsne')
+        latents: shape [N, latent_dim], all latent vectors.
+        labels: shape [N], integer labels (0,1,2).
+        save_path: path to save the figure.
+        method: 'pca' or 'tsne'.
+        perplexity: used for t-SNE (hyperparameter).
     """
-    try:
-        from sklearn.decomposition import PCA
-        from sklearn.manifold import TSNE
-    except ImportError:
-        print("scikit-learn is required for latent space visualization")
-        return
-    
-    # Set model to evaluation mode
-    model.eval()
-    
-    # Collect latent representations
-    latent_vectors = []
-    image_tensors = []
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            if len(latent_vectors) * batch["image"].size(0) >= n_samples:
-                break
-                
-            images = batch["image"].to(device)
-            image_tensors.append(batch["image"])
-            
-            # Forward pass through encoder
-            features = images
-            for stage in model.encoder_stages[:-1]:
-                features = stage(features)
-            
-            # Last encoder stage output is the latent representation
-            latent = model.encoder_stages[-1](features)
-            
-            # Store latent vectors
-            latent_vectors.append(latent.cpu())
-    
-    # Concatenate all batches
-    latent_vectors = torch.cat(latent_vectors, dim=0)[:n_samples]
-    image_tensors = torch.cat(image_tensors, dim=0)[:n_samples]
-    
-    # Flatten latent vectors for dimensionality reduction
-    latent_flat = latent_vectors.reshape(latent_vectors.size(0), -1).numpy()
-    
-    # Apply dimensionality reduction
-    if method == 'pca':
+    # Dimensionality reduction
+    if method.lower() == 'pca':
         reducer = PCA(n_components=2)
-        reduced_data = reducer.fit_transform(latent_flat)
-        title = "PCA of Latent Space"
-    else:  # tsne
-        reducer = TSNE(n_components=2, random_state=42)
-        reduced_data = reducer.fit_transform(latent_flat)
-        title = "t-SNE of Latent Space"
+    elif method.lower() == 'tsne':
+        reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'pca' or 'tsne'.")
     
-    # Create scatter plot
-    plt.figure(figsize=(10, 8))
-    plt.scatter(reduced_data[:, 0], reduced_data[:, 1], alpha=0.6, s=10)
-    plt.title(title)
-    plt.xlabel("Dimension 1")
-    plt.ylabel("Dimension 2")
+    reduced = reducer.fit_transform(latents)  # shape [N,2]
+    
+    # Plot
+    plt.figure(figsize=(8, 6))
+    
+    # If you have exactly 3 labels {0,1,2}, you can color them easily:
+    scatter = plt.scatter(
+        reduced[:, 0], 
+        reduced[:, 1], 
+        c=labels, 
+        alpha=0.7
+    )
+    plt.title(f"Latent Space ({method.upper()})")
+    plt.xlabel("Dim 1")
+    plt.ylabel("Dim 2")
+    plt.grid(True)
+    
+    # Create a legend for the 3 classes if you want
+    # A quick trick is to create a legend based on unique labels
+    unique_labels = np.unique(labels)
+    cbar = plt.colorbar(scatter)
+    cbar.set_ticks(unique_labels)
+    cbar.set_ticklabels([f"Class {u}" for u in unique_labels])
+    
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(save_path, dpi=300)
     plt.close()
-    
-    # Optionally create a version with sample images
-    try:
-        # Create figure with sample thumbnails
-        fig, ax = plt.subplots(figsize=(12, 10))
-        
-        # Plot main scatter points
-        ax.scatter(reduced_data[:, 0], reduced_data[:, 1], alpha=0.2, s=5, c='gray')
-        
-        # Select a subset of points to show thumbnails
-        n_thumbnails = min(20, n_samples)
-        indices = np.linspace(0, n_samples-1, n_thumbnails, dtype=int)
-        
-        # Add thumbnails to plot
-        for idx in indices:
-            img = denormalize_image(image_tensors[idx])
-            
-            # Create a small thumbnail
-            thumbnail_size = 0.05  # Size relative to figure
-            thumb_img = plt.axes([0, 0, thumbnail_size, thumbnail_size])
-            thumb_img.imshow(img)
-            thumb_img.set_position([
-                reduced_data[idx, 0] - thumbnail_size/2, 
-                reduced_data[idx, 1] - thumbnail_size/2, 
-                thumbnail_size, 
-                thumbnail_size
-            ])
-            thumb_img.axis('off')
-        
-        ax.set_title(f"{title} with Sample Images")
-        ax.set_xlabel("Dimension 1")
-        ax.set_ylabel("Dimension 2")
-        
-        plt.savefig(f"{os.path.splitext(output_path)[0]}_with_samples.png", dpi=150, bbox_inches='tight')
-        plt.close(fig)
-    except Exception as e:
-        print(f"Error creating thumbnail visualization: {e}")
+    print(f"[{method.upper()}] Saved 2D embedding plot to {save_path}")
 
 
 def plot_reconstruction_metrics(

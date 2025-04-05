@@ -70,19 +70,6 @@ Tools and techniques for augmenting the pet dataset:
 
 [Read more about data_augmentation](./data_augmentation/README.md)
 
-## Performance Comparison
-
-| Model | Pixel Accuracy | Mean IoU | Mean Foreground Dice | Cat Dice | Dog Dice |
-|-------|---------------|----------|----------------------|----------|----------|
-| Our_UNet | 87.57% | 68.90% | 75.11% | 72.07% | 78.16% |
-| CLIP_UNet | 89.32% | 71.46% | 78.52% | 75.89% | 81.15% |
-| AE_pretrained | 86.21% | 67.33% | 73.82% | 70.45% | 77.19% |
-
-Class-specific metrics for Our_UNet:
-- **Background**: Dice 92.60%, IoU 86.22%, Precision 87.85%, Recall 97.89%
-- **Cat**: Dice 72.07%, IoU 56.33%, Precision 89.17%, Recall 60.46%
-- **Dog**: Dice 78.16%, IoU 64.14%, Precision 85.72%, Recall 71.81%
-
 ## Installation
 
 1. Clone the repository:

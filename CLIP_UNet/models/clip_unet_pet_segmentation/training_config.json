@@ -1,0 +1,17 @@
+{
+    "data_dir": "/home/ulixes/segmentation_cv/unet/data/processed",
+    "output_dir": "models/clip_unet_pet_segmentation",
+    "batch_size": 16,
+    "epochs": 200,
+    "lr": 0.005,
+    "weight_decay": 0.0001,
+    "momentum": 0.99,
+    "num_workers": 4,
+    "save_every": 10,
+    "patience": 15,
+    "device": "",
+    "resume": "",
+    "amp": true,
+    "use_clip": true,
+    "clip_model": "ViT-B/16"
+}

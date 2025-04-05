@@ -1,0 +1,17 @@
+{
+    "data_dir": "/home/ulixes/segmentation_cv/unet/data/processed",
+    "output_dir": "models/ae_pet_reconstruction",
+    "batch_size": 32,
+    "epochs": 200,
+    "lr": 0.001,
+    "weight_decay": 1e-05,
+    "num_workers": 4,
+    "save_every": 10,
+    "patience": 15,
+    "device": "",
+    "resume": "",
+    "amp": true,
+    "mse_weight": 1.0,
+    "perceptual_weight": 0.1,
+    "ssim_weight": 0.1
+}

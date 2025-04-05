@@ -1,0 +1,16 @@
+{
+    "data_dir": "/home/ulixes/segmentation_cv/unet/data/processed/",
+    "output_dir": "/home/ulixes/segmentation_cv/unet/AE_pretrained/reconstruction/models/ae_pet_reconstruction",
+    "batch_size": 32,
+    "epochs": 200,
+    "lr": 0.005,
+    "weight_decay": 0.0001,
+    "momentum": 0.99,
+    "num_workers": 4,
+    "save_every": 10,
+    "patience": 15,
+    "reduced_complexity": true,
+    "device": "",
+    "resume": "",
+    "amp": true
+}
